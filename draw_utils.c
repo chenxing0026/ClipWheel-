@@ -6,14 +6,17 @@ HFONT create_app_font(int height, int weight, const wchar_t *face) {
 }
 
 void init_theme_objects(void) {
-    if (!g_font_display) g_font_display = create_app_font(-44, FW_SEMIBOLD, L"Microsoft YaHei UI");
-    if (!g_font_title) g_font_title = create_app_font(-22, FW_SEMIBOLD, L"Microsoft YaHei UI");
-    if (!g_font_body) g_font_body = create_app_font(-18, FW_NORMAL, L"Microsoft YaHei UI");
-    if (!g_font_body_bold) g_font_body_bold = create_app_font(-18, FW_SEMIBOLD, L"Microsoft YaHei UI");
-    if (!g_font_caption) g_font_caption = create_app_font(-14, FW_NORMAL, L"Microsoft YaHei UI");
-    if (!g_brush_light) g_brush_light = CreateSolidBrush(COL_BG_DEEP);
-    if (!g_brush_dark) g_brush_dark = CreateSolidBrush(COL_BG_SURFACE);
-    if (!g_brush_white) g_brush_white = CreateSolidBrush(COL_BG_CARD);
+    const wchar_t *face_display = g_theme == THEME_LIGHT ? FONT_DISPLAY_LIGHT : FONT_DISPLAY_DARK;
+    const wchar_t *face_body = g_theme == THEME_LIGHT ? FONT_BODY_LIGHT : FONT_BODY_DARK;
+    int display_wt = g_theme == THEME_LIGHT ? FW_NORMAL : FW_SEMIBOLD;
+    if (!g_font_display) g_font_display = create_app_font(FONT_SIZE_DISPLAY, display_wt, face_display);
+    if (!g_font_title) g_font_title = create_app_font(FONT_SIZE_TITLE, FW_SEMIBOLD, face_body);
+    if (!g_font_body) g_font_body = create_app_font(FONT_SIZE_BODY, FW_NORMAL, face_body);
+    if (!g_font_body_bold) g_font_body_bold = create_app_font(FONT_SIZE_BODY, FW_SEMIBOLD, face_body);
+    if (!g_font_caption) g_font_caption = create_app_font(FONT_SIZE_CAPTION, FW_NORMAL, face_body);
+    if (!g_brush_bg_deep) g_brush_bg_deep = CreateSolidBrush(TC_BG_DEEPEST);
+    if (!g_brush_bg_surface) g_brush_bg_surface = CreateSolidBrush(TC_BG_SURFACE);
+    if (!g_brush_bg_card) g_brush_bg_card = CreateSolidBrush(TC_BG_CARD);
 }
 
 void destroy_theme_objects(void) {
@@ -22,11 +25,11 @@ void destroy_theme_objects(void) {
     if (g_font_body) DeleteObject(g_font_body);
     if (g_font_body_bold) DeleteObject(g_font_body_bold);
     if (g_font_caption) DeleteObject(g_font_caption);
-    if (g_brush_light) DeleteObject(g_brush_light);
-    if (g_brush_dark) DeleteObject(g_brush_dark);
-    if (g_brush_white) DeleteObject(g_brush_white);
+    if (g_brush_bg_deep) DeleteObject(g_brush_bg_deep);
+    if (g_brush_bg_surface) DeleteObject(g_brush_bg_surface);
+    if (g_brush_bg_card) DeleteObject(g_brush_bg_card);
     g_font_display = g_font_title = g_font_body = g_font_body_bold = g_font_caption = NULL;
-    g_brush_light = g_brush_dark = g_brush_white = NULL;
+    g_brush_bg_deep = g_brush_bg_surface = g_brush_bg_card = NULL;
 }
 
 float clamp01f(float v) {
@@ -97,7 +100,7 @@ void draw_rounded_rect(HDC hdc, const RECT *rc, COLORREF fill, COLORREF border, 
     DeleteObject(pen);
 
     if ((rc->right - rc->left) > 20 && (rc->bottom - rc->top) > 20) {
-        HPEN hi = CreatePen(PS_SOLID, 1, mix_color(fill, COL_WHITE, 0.10f));
+        HPEN hi = CreatePen(PS_SOLID, 1, mix_color(fill, TC_WHITE, 0.10f));
         HGDIOBJ old_hi_pen = SelectObject(hdc, hi);
         HGDIOBJ old_hi_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         RoundRect(hdc, rc->left + 1, rc->top + 1, rc->right - 1, rc->bottom - 1, (radius - 1) * 2, (radius - 1) * 2);
@@ -141,40 +144,40 @@ void draw_button(const DRAWITEMSTRUCT *di) {
     int primary = button_is_primary(id);
     COLORREF fill_top, fill_bottom, text, border;
     wchar_t text_buf[64];
-    int radius = 10;
+    int radius = RADIUS_MD;
     int disabled = (di->itemState & ODS_DISABLED) != 0;
     int pressed = (di->itemState & ODS_SELECTED) != 0;
     int hot = (di->itemState & ODS_HOTLIGHT) != 0;
 
     if (primary) {
-        fill_top = pressed ? RGB(87, 97, 233) : RGB(109, 119, 252);
-        fill_bottom = pressed ? RGB(72, 81, 216) : RGB(86, 96, 233);
-        text = COL_WHITE;
-        border = pressed ? RGB(132, 144, 255) : RGB(118, 131, 248);
+        fill_top = pressed ? TC_ACCENT_DEEP : TC_ACCENT;
+        fill_bottom = pressed ? mix_color(TC_ACCENT_DEEP, TC_BG_ELEVATED, 0.3f) : mix_color(TC_ACCENT, TC_BG_ELEVATED, 0.2f);
+        text = TC_WHITE;
+        border = pressed ? TC_ACCENT_HOVER : mix_color(TC_ACCENT, TC_ACCENT_HOVER, 0.5f);
     } else {
-        fill_top = pressed ? RGB(56, 58, 74) : RGB(62, 65, 84);
-        fill_bottom = pressed ? RGB(44, 47, 62) : RGB(48, 50, 66);
-        text = hot ? COL_WHITE : COL_TEXT_PRIMARY;
-        border = hot ? COL_BORDER_FOCUS : COL_BORDER_SUBTLE;
+        fill_top = pressed ? TC_BG_ELEVATED : TC_BG_OVERLAY;
+        fill_bottom = pressed ? TC_BG_CARD : TC_BG_ELEVATED;
+        text = hot ? TC_WHITE : TC_TEXT_PRIMARY;
+        border = hot ? TC_BORDER_FOCUS : TC_BORDER_DEFAULT;
     }
 
     if (disabled) {
-        fill_top = RGB(58, 60, 70);
-        fill_bottom = RGB(48, 50, 60);
-        text = COL_TEXT_TERTIARY;
-        border = RGB(65, 68, 78);
+        fill_top = TC_BG_ELEVATED;
+        fill_bottom = TC_BG_CARD;
+        text = TC_TEXT_DISABLED;
+        border = TC_BORDER_DEFAULT;
     }
 
     if (!pressed && !disabled) {
         RECT shadow = rc;
         OffsetRect(&shadow, 0, 1);
-        draw_rounded_rect(di->hDC, &shadow, RGB(14, 15, 24), RGB(14, 15, 24), radius);
+        draw_rounded_rect(di->hDC, &shadow, TC_BG_DEEP, TC_BG_DEEP, radius);
     }
     fill_round_gradient(di->hDC, &rc, fill_top, fill_bottom, radius);
     draw_round_border(di->hDC, &rc, border, radius, 1);
 
     if (!disabled) {
-        COLORREF hi = primary ? RGB(165, 174, 255) : RGB(98, 102, 122);
+        COLORREF hi = primary ? TC_ACCENT_GLOW : mix_color(TC_TEXT_TERTIARY, TC_BG_OVERLAY, 0.5f);
         HPEN highlight = CreatePen(PS_SOLID, 1, hi);
         HGDIOBJ old_pen = SelectObject(di->hDC, highlight);
         MoveToEx(di->hDC, rc.left + radius, rc.top + 1, NULL);
@@ -192,6 +195,6 @@ void draw_button(const DRAWITEMSTRUCT *di) {
     if (di->itemState & ODS_FOCUS) {
         RECT focus = rc;
         InflateRect(&focus, -3, -3);
-        draw_round_border(di->hDC, &focus, COL_BORDER_FOCUS, radius - 2, 2);
+        draw_round_border(di->hDC, &focus, TC_BORDER_FOCUS, radius - 2, 2);
     }
 }

@@ -16,7 +16,8 @@ HWND g_auto_paste_hwnd;
 HWND g_floating_mode_hwnd;
 HWND g_record_btn_hwnd;
 HWND g_wheel_preview_hwnd;
-static HWND g_auto_start_hwnd = NULL;
+HWND g_auto_start_hwnd = NULL;
+HWND g_dark_mode_hwnd = NULL;
 static int g_side_w_left = 260;
 static int g_side_w_right = 260;
 static int g_dragging_splitter = 0; // 0: none, 1: left, 2: right
@@ -29,12 +30,14 @@ int g_vk = VK_OEM_3;
 int g_mod;
 int g_auto_paste = 1;
 int g_floating_mode = 0;
+ThemeMode g_theme = THEME_LIGHT;
 
 volatile int g_wheel_visible;
 volatile int g_hotkey_suppress;
 int g_sel = -1;
 int g_slot_count;
 wchar_t g_slots[CW_MAX_SLOT][CW_MAX_CHARS];
+wchar_t g_slot_display[CW_MAX_SLOT][64];
 HWND g_target_hwnd;
 POINT g_original_cursor_pos;
 POINT g_wheel_center_screen;
@@ -53,14 +56,20 @@ int g_tray_tip_shown;
 wchar_t g_ini[MAX_PATH];
 wchar_t g_hotkey_label[64];
 
+/* Inline rename state */
+HWND g_rename_edit;
+int g_rename_pin_index = -1;
+int g_rename_card_y;
+static HFONT g_rename_font;
+
 HFONT g_font_display;
 HFONT g_font_title;
 HFONT g_font_body;
 HFONT g_font_body_bold;
 HFONT g_font_caption;
-HBRUSH g_brush_light;
-HBRUSH g_brush_dark;
-HBRUSH g_brush_white;
+HBRUSH g_brush_bg_deep;
+HBRUSH g_brush_bg_surface;
+HBRUSH g_brush_bg_card;
 
 int   g_prev_hover_sector   = -1;
 int   g_prev_x_hover_sector = -1;
@@ -96,6 +105,8 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                 UINT_PTR idSubclass, DWORD_PTR refData);
 
 /* ─── Utility ─────────────────────────────────────────────────────────────── */
 void enable_dpi_awareness(void) {
@@ -140,12 +151,15 @@ void load_config(void) {
     g_mod = GetPrivateProfileIntW(L"Hotkey", L"Mod", 0, g_ini);
     g_auto_paste = GetPrivateProfileIntW(L"Behavior", L"AutoPaste", 1, g_ini) ? 1 : 0;
     g_floating_mode = GetPrivateProfileIntW(L"Behavior", L"FloatingMode", 0, g_ini) ? 1 : 0;
+    g_theme = GetPrivateProfileIntW(L"Behavior", L"DarkMode", 0, g_ini) ? THEME_DARK : THEME_LIGHT;
     format_hotkey_label();
 }
 
 void save_behavior_config(void) {
     WritePrivateProfileStringW(L"Behavior", L"AutoPaste", g_auto_paste ? L"1" : L"0", g_ini);
     WritePrivateProfileStringW(L"Behavior", L"FloatingMode", g_floating_mode ? L"1" : L"0", g_ini);
+    WritePrivateProfileStringW(L"Behavior", L"DarkMode",
+        g_theme == THEME_DARK ? L"1" : L"0", g_ini);
 }
 
 void save_hotkey_config(void) {
@@ -189,7 +203,10 @@ int slot_to_sector(int slot) {
 }
 
 void build_slots(void) {
+    ZeroMemory(g_slots, sizeof(g_slots));
+    ZeroMemory(g_slot_display, sizeof(g_slot_display));
     g_slot_count = cw_history_fill_slots(g_slots);
+    cw_history_fill_slot_display(g_slot_display);
     if (g_sel != 4) {
         if (g_slot_count <= 0) g_sel = -1;
         else {
@@ -293,9 +310,21 @@ void apply_selection_to_target(void) {
 
 static const double WHEEL_PI = 3.14159265358979323846;
 
+/* Rich, saturated sector palette - vibrant but harmonious */
 static const COLORREF kSectorPalette[NSECT] = {
-    RGB(91, 140, 250), RGB(131, 108, 245), RGB(154, 127, 255), RGB(76, 189, 201),
-    RGB(71, 162, 255), RGB(105, 136, 249), RGB(121, 93, 236), RGB(88, 196, 161)
+    RGB(99, 145, 255),   /* 0: Blue */
+    RGB(139, 110, 255),  /* 1: Violet */
+    RGB(168, 130, 255),  /* 2: Lavender */
+    RGB(80, 200, 210),   /* 3: Cyan */
+    RGB(75, 175, 255),   /* 4: Cancel (blue) */
+    RGB(115, 145, 255),  /* 5: Periwinkle */
+    RGB(130, 100, 245),  /* 6: Purple */
+    RGB(90, 210, 170)    /* 7: Teal */
+};
+
+static const COLORREF kSectorPaletteLight[NSECT] = {
+    RGB(204, 120, 92),  RGB(210, 150, 100), RGB(160, 140, 110), RGB(100, 160, 140),
+    RGB(120, 140, 170), RGB(180, 130, 140), RGB(140, 120, 160), RGB(90, 155, 140)
 };
 
 static void wheel_origin(HDC hdc, int w, int h, int *cx, int *cy) {
@@ -310,16 +339,28 @@ static void wheel_origin(HDC hdc, int w, int h, int *cx, int *cy) {
         *cx = g_wheel_center_screen.x - g_overlay_vx;
         *cy = g_wheel_center_screen.y - g_overlay_vy;
         if (*cx <= 0 || *cx >= w || *cy <= 0 || *cy >= h) { *cx = w / 2; *cy = h / 2; }
-        fill_vertical_gradient(hdc, &rc, RGB(7, 8, 14), RGB(10, 10, 14));
+        fill_vertical_gradient(hdc, &rc, TC_BG_DEEP, mix_color(TC_BG_DEEP, TC_BG_SURFACE, 0.3f));
     }
 }
 
 static void draw_glow_rings(HDC hdc, int cx, int cy, int outer_r) {
     int s1 = SaveDC(hdc);
-    for (int i = 4; i >= 1; --i) {
-        int r = outer_r + i * 18;
-        COLORREF glow = mix_color(COL_ACCENT_GLOW, COL_BG_DEEP, 0.55f + (float)i * 0.1f);
-        HPEN p = CreatePen(PS_SOLID, 2, glow);
+    /* 3 soft glow rings - wider spacing, more subtle */
+    for (int i = 3; i >= 1; --i) {
+        int r = outer_r + i * 24;
+        COLORREF glow = mix_color(TC_ACCENT_GLOW, TC_BG_DEEP, 0.65f + (float)i * 0.10f);
+        HPEN p = CreatePen(PS_SOLID, 3, glow);
+        HGDIOBJ op = SelectObject(hdc, p);
+        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+        SelectObject(hdc, op); SelectObject(hdc, ob);
+        DeleteObject(p);
+    }
+    /* Outermost faint ring */
+    {
+        int r = outer_r + 96;
+        COLORREF glow = mix_color(TC_ACCENT_GLOW, TC_BG_DEEP, 0.85f);
+        HPEN p = CreatePen(PS_SOLID, 1, glow);
         HGDIOBJ op = SelectObject(hdc, p);
         HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
@@ -331,8 +372,8 @@ static void draw_glow_rings(HDC hdc, int cx, int cy, int outer_r) {
 
 static void draw_wheel_base(HDC hdc, int cx, int cy, int outer_r) {
     RECT wr = {cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r};
-    fill_round_gradient(hdc, &wr, RGB(28, 30, 40), RGB(16, 17, 25), outer_r);
-    draw_round_border(hdc, &wr, mix_color(COL_WHEEL_BORDER, COL_ACCENT_HOVER, 0.35f), outer_r, 2);
+    fill_round_gradient(hdc, &wr, TC_WHEEL_SECTOR, TC_WHEEL_BG, outer_r);
+    draw_round_border(hdc, &wr, mix_color(TC_WHEEL_BORDER, TC_ACCENT_HOVER, 0.30f), outer_r, 2);
 }
 
 static void draw_wheel_sectors(HDC hdc, int cx, int cy, int outer_r, double step) {
@@ -342,15 +383,20 @@ static void draw_wheel_sectors(HDC hdc, int cx, int cy, int outer_r, double step
         int slot = sector_to_slot(i);
         int active = (slot >= 0 && slot < g_slot_count);
         float heat = g_sector_heat[i];
-        COLORREF base = kSectorPalette[i];
+        const COLORREF *sector_pal = g_theme == THEME_LIGHT ? kSectorPaletteLight : kSectorPalette;
+        COLORREF base = sector_pal[i];
+
+        /* Cancel zone: rich red gradient */
         COLORREF fill = (i == 4)
-            ? mix_color(RGB(100, 30, 30), RGB(220, 50, 50), 0.30f + heat * 0.55f)
+            ? mix_color(TC_CANCEL_SECTOR_A, TC_CANCEL_SECTOR_B, 0.25f + heat * 0.60f)
             : active
-                ? mix_color(mix_color(COL_WHEEL_SECTOR, base, 0.25f), base, 0.40f + heat * 0.50f)
-                : mix_color(RGB(32, 34, 46), RGB(24, 26, 36), 0.5f);
+                ? mix_color(mix_color(TC_WHEEL_SECTOR, base, 0.30f), base, 0.45f + heat * 0.50f)
+                : mix_color(TC_WHEEL_SECTOR, TC_WHEEL_BG, 0.5f);
+
         COLORREF border = (i == 4)
-            ? mix_color(RGB(180, 50, 50), RGB(255, 120, 120), heat * 0.75f)
-            : mix_color(COL_WHEEL_BORDER, COL_ACCENT_GLOW, heat * 0.75f);
+            ? mix_color(TC_CANCEL_BORDER_A, TC_CANCEL_BORDER_B, heat * 0.80f)
+            : mix_color(TC_WHEEL_BORDER, TC_ACCENT_GLOW, heat * 0.70f);
+
         HBRUSH br = CreateSolidBrush(fill);
         HPEN pen = CreatePen(PS_SOLID, (active || i == 4) ? 1 : 0, border);
         HGDIOBJ obr = SelectObject(hdc, br);
@@ -363,36 +409,58 @@ static void draw_wheel_sectors(HDC hdc, int cx, int cy, int outer_r, double step
         SelectObject(hdc, obr); SelectObject(hdc, opn);
         DeleteObject(br); DeleteObject(pen);
     }
+    /* Draw sector divider lines for better visual separation */
+    {
+        HPEN div = CreatePen(PS_SOLID, 1, mix_color(TC_BORDER_DEFAULT, TC_BG_DEEP, 0.5f));
+        HGDIOBJ op = SelectObject(hdc, div);
+        for (int i = 0; i < NSECT; ++i) {
+            double angle = -WHEEL_PI / 2.0 + i * step - step / 2.0;
+            int x1 = cx + (int)(INNER_R * cos(angle));
+            int y1 = cy - (int)(INNER_R * sin(angle));
+            int x2 = cx + (int)(outer_r * cos(angle));
+            int y2 = cy - (int)(outer_r * sin(angle));
+            MoveToEx(hdc, x1, y1, NULL);
+            LineTo(hdc, x2, y2);
+        }
+        SelectObject(hdc, op); DeleteObject(div);
+    }
     RestoreDC(hdc, s2);
 }
 
 static void draw_wheel_hub(HDC hdc, int cx, int cy, int inner_r, float appear, float t_text) {
     int s3 = SaveDC(hdc);
     RECT hub = {cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r};
-    fill_round_gradient(hdc, &hub, RGB(36, 38, 52), RGB(23, 24, 34), inner_r);
-    draw_round_border(hdc, &hub, mix_color(COL_ACCENT, COL_ACCENT_GLOW, 0.35f), inner_r, 2);
+    fill_round_gradient(hdc, &hub, TC_BG_ELEVATED, TC_BG_CARD, inner_r);
+    draw_round_border(hdc, &hub, mix_color(TC_ACCENT, TC_ACCENT_GLOW, 0.35f), inner_r, 2);
 
-    int card_w = (int)(360.0f * (0.6f + 0.4f * appear));
-    int card_h = (int)(122.0f * (0.6f + 0.4f * appear));
+    /* Inner hub ring for depth */
+    {
+        int ir = inner_r - 4;
+        RECT inner = {cx - ir, cy - ir, cx + ir, cy + ir};
+        draw_round_border(hdc, &inner, mix_color(TC_BORDER_DEFAULT, TC_ACCENT, 0.20f), ir, 1);
+    }
+
+    int card_w = (int)(340.0f * (0.6f + 0.4f * appear));
+    int card_h = (int)(110.0f * (0.6f + 0.4f * appear));
     RECT ccard = {cx - card_w / 2, cy - card_h / 2, cx + card_w / 2, cy + card_h / 2};
-    fill_round_gradient(hdc, &ccard, RGB(33, 35, 48), RGB(22, 24, 33), 24);
-    draw_round_border(hdc, &ccard, mix_color(COL_ACCENT, COL_ACCENT_GLOW, 0.45f), 24, 2);
+    fill_round_gradient(hdc, &ccard, TC_BG_CARD, mix_color(TC_BG_SURFACE, TC_BG_DEEP, 0.5f), RADIUS_2XL);
+    draw_round_border(hdc, &ccard, mix_color(TC_ACCENT, TC_ACCENT_GLOW, 0.40f), RADIUS_2XL, 1);
 
     SelectObject(hdc, g_font_body);
-    SetTextColor(hdc, mix_color(COL_TEXT_SECONDARY, COL_TEXT_PRIMARY, 0.35f + 0.65f * t_text));
+    SetTextColor(hdc, mix_color(TC_TEXT_SECONDARY, TC_TEXT_PRIMARY, 0.35f + 0.65f * t_text));
     if (g_sel == 4) {
-        SetTextColor(hdc, RGB(255, 120, 120));
-        DrawTextW(hdc, L"松开取消", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SetTextColor(hdc, TC_DANGER);
+        DrawTextW(hdc, L"\u677e\u5f00\u53d6\u6d88", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     } else {
         int sel_slot = sector_to_slot(g_sel);
         if (g_slot_count == 0) {
-            DrawTextW(hdc, L"还没有可用内容", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            DrawTextW(hdc, L"\u8fd8\u6ca1\u6709\u53ef\u7528\u5185\u5bb9", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         } else if (sel_slot >= 0 && sel_slot < g_slot_count) {
-            wchar_t preview[CW_MAX_CHARS];
+            wchar_t preview[64];
             truncate_preview(preview, ARRAYSIZE(preview), g_slots[sel_slot], 88);
             DrawTextW(hdc, preview, -1, &ccard, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
         } else {
-            DrawTextW(hdc, L"移动鼠标选择，松开热键粘贴", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            DrawTextW(hdc, L"\u79fb\u52a8\u9f20\u6807\u9009\u62e9\uff0c\u677e\u5f00\u70ed\u952e\u7c98\u8d34", -1, &ccard, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
     }
     RestoreDC(hdc, s3);
@@ -401,42 +469,75 @@ static void draw_wheel_hub(HDC hdc, int cx, int cy, int inner_r, float appear, f
 static void draw_wheel_labels(HDC hdc, int cx, int cy, int outer_r, int inner_r,
                               double step, float t_text) {
     int s4 = SaveDC(hdc);
-    SelectObject(hdc, g_font_caption);
+    SelectObject(hdc, g_font_body);
     for (int i = 0; i < NSECT; ++i) {
         int slot = sector_to_slot(i);
         double mid = -WHEEL_PI / 2.0 + i * step;
-        int mx = cx + (int)((inner_r + 96) * cos(mid));
-        int my = cy - (int)((inner_r + 96) * sin(mid));
-        RECT lr = {mx - 78, my - 16, mx + 78, my + 16};
+        /* Labels sit between inner hub and outer edge */
+        int label_r = (inner_r + outer_r) / 2 + 10;
+        int mx = cx + (int)(label_r * cos(mid));
+        int my = cy - (int)(label_r * sin(mid));
+        RECT lr = {mx - 80, my - 16, mx + 80, my + 16};
+
         if (i == 4) {
-            SetTextColor(hdc, mix_color(RGB(200, 80, 80), RGB(255, 130, 130), g_sector_heat[i]));
+            /* Cancel zone label */
+            RECT pill = {mx - 60, my - 12, mx + 60, my + 12};
+            {
+                COLORREF cp_top1 = TC_CANCEL_PILL_A1;
+                COLORREF cp_top2 = TC_CANCEL_PILL_A2;
+                COLORREF cp_bot   = TC_CANCEL_PILL_B;
+                COLORREF cb1      = TC_CANCEL_PILL_BRD_A;
+                COLORREF cb2      = TC_CANCEL_PILL_BRD_B;
+                fill_round_gradient(hdc, &pill, mix_color(cp_top1, cp_top2, 0.5f), cp_bot, RADIUS_MD);
+                draw_round_border(hdc, &pill, mix_color(cb1, cb2, g_sector_heat[i]), RADIUS_MD, 1);
+            }
+            SetTextColor(hdc, mix_color(TC_DANGER_DEEP, TC_DANGER, g_sector_heat[i]));
             DrawTextW(hdc, L"\u2715 \u53d6\u6d88", -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         } else if (slot >= 0 && slot < g_slot_count) {
             wchar_t prev[64];
-            truncate_preview(prev, ARRAYSIZE(prev), g_slots[slot], 26);
+            truncate_preview(prev, ARRAYSIZE(prev), g_slot_display[slot], 22);
+
+            /* Dark pill background for ALL labels - improves readability */
+            RECT pill = {mx - 68, my - 13, mx + 68, my + 13};
+            float pill_alpha = (i == g_sel) ? 0.0f : 0.15f + 0.25f * g_sector_heat[i];
+            COLORREF pill_top = (i == g_sel)
+                ? mix_color(TC_ACCENT, TC_ACCENT_DEEP, 0.3f)
+                : mix_color(TC_BG_DEEP, TC_BG_CARD, pill_alpha);
+            COLORREF pill_bot = (i == g_sel)
+                ? mix_color(TC_ACCENT_DEEP, TC_BG_ELEVATED, 0.4f)
+                : mix_color(TC_BG_DEEP, TC_BG_SURFACE, pill_alpha);
+            fill_round_gradient(hdc, &pill, pill_top, pill_bot, RADIUS_MD);
+            draw_round_border(hdc, &pill,
+                (i == g_sel) ? TC_ACCENT_GLOW : mix_color(TC_BORDER_DEFAULT, TC_ACCENT, 0.15f + 0.20f * g_sector_heat[i]),
+                RADIUS_MD, 1);
+
+            /* Text color: bright and readable */
             if (i == g_sel) {
-                RECT chip = {mx - 72, my - 14, mx + 72, my + 14};
-                fill_round_gradient(hdc, &chip, RGB(102, 112, 250), RGB(84, 95, 232), 12);
-                draw_round_border(hdc, &chip, COL_ACCENT_GLOW, 12, 1);
-                SetTextColor(hdc, COL_WHITE);
+                SetTextColor(hdc, TC_WHITE);
             } else {
-                SetTextColor(hdc, mix_color(COL_TEXT_TERTIARY, COL_TEXT_SECONDARY, 0.45f + 0.55f * g_sector_heat[i]));
+                SetTextColor(hdc, mix_color(
+                    TC_LABEL_SUBTLE,
+                    TC_WHITE, 0.20f + 0.30f * g_sector_heat[i]));
             }
             DrawTextW(hdc, prev, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
+
+    /* Brand badge above wheel */
     {
-        RECT br = {cx - 128, cy - outer_r - 72, cx + 128, cy - outer_r - 30};
-        fill_round_gradient(hdc, &br, RGB(33, 34, 47), RGB(21, 22, 30), 14);
-        draw_round_border(hdc, &br, mix_color(COL_ACCENT, COL_ACCENT_GLOW, 0.40f), 14, 1);
-        SetTextColor(hdc, mix_color(COL_ACCENT_GLOW, COL_WHITE, 0.35f));
+        RECT br = {cx - 120, cy - outer_r - 68, cx + 120, cy - outer_r - 28};
+        fill_round_gradient(hdc, &br, TC_BG_CARD, TC_BG_SURFACE, RADIUS_LG);
+        draw_round_border(hdc, &br, mix_color(TC_ACCENT, TC_ACCENT_GLOW, 0.35f), RADIUS_LG, 1);
+        SetTextColor(hdc, mix_color(TC_ACCENT_GLOW, TC_WHITE, 0.40f));
         SelectObject(hdc, g_font_title);
         DrawTextW(hdc, L"ClipWheel", -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
+
+    /* Hint bar below wheel */
     {
-        RECT hint = {cx - 180, cy + outer_r + 24, cx + 180, cy + outer_r + 52};
-        SetBkColor(hdc, RGB(12, 12, 18));
-        SetTextColor(hdc, mix_color(COL_TEXT_TERTIARY, COL_TEXT_SECONDARY, t_text));
+        RECT hint = {cx - 180, cy + outer_r + 20, cx + 180, cy + outer_r + 48};
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, mix_color(TC_TEXT_TERTIARY, TC_TEXT_SECONDARY, t_text));
         SelectObject(hdc, g_font_caption);
         DrawTextW(hdc, L"ESC \u6216\u6ed1\u81f3\u5e95\u90e8\u53d6\u6d88 \xb7 \u677e\u5f00\u7c98\u8d34 \xb7 \u2190\u2191\u2193\u2192\u9009\u6247\u533a", -1, &hint, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
@@ -714,6 +815,176 @@ void apply_undo(HWND owner) {
     refresh_manager_ui();
 }
 
+/* ─── Input Box (custom dark popup) ───────────────────────────────────────── */
+
+#define IB_ID_EDIT   1001
+#define IB_ID_OK     1002
+#define IB_ID_CANCEL 1003
+#define IB_W  420
+#define IB_H  160
+
+static HFONT s_ib_font;
+static HFONT s_ib_font_sm;
+static HWND s_ib_edit;
+static wchar_t s_ib_title[128];
+static wchar_t s_ib_out[64];
+static int s_ib_dpi;
+static int s_ib_result;
+
+static int ib_scale(int v) { return MulDiv(v, s_ib_dpi, 96); }
+
+static void ib_create_controls(HWND hwnd) {
+    s_ib_font = create_app_font(-ib_scale(14), FW_NORMAL, L"Microsoft YaHei UI");
+    s_ib_font_sm = create_app_font(-ib_scale(12), FW_NORMAL, L"Microsoft YaHei UI");
+
+    s_ib_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        ib_scale(20), ib_scale(50), ib_scale(IB_W - 40), ib_scale(28),
+        hwnd, (HMENU)(INT_PTR)IB_ID_EDIT, g_hinst, NULL);
+    SendMessageW(s_ib_edit, WM_SETFONT, (WPARAM)s_ib_font, TRUE);
+
+    CreateWindowExW(0, L"BUTTON", L"\u786e\u5b9a",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        ib_scale(IB_W - 200), ib_scale(IB_H - 48), ib_scale(80), ib_scale(32),
+        hwnd, (HMENU)(INT_PTR)IB_ID_OK, g_hinst, NULL);
+
+    CreateWindowExW(0, L"BUTTON", L"\u53d6\u6d88",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        ib_scale(IB_W - 110), ib_scale(IB_H - 48), ib_scale(80), ib_scale(32),
+        hwnd, (HMENU)(INT_PTR)IB_ID_CANCEL, g_hinst, NULL);
+}
+
+static LRESULT CALLBACK ib_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        s_ib_dpi = GetDpiForWindow(hwnd);
+        ib_create_controls(hwnd);
+        const wchar_t *initial = (const wchar_t *)((CREATESTRUCTW *)lp)->lpCreateParams;
+        if (initial && s_ib_edit) SetWindowTextW(s_ib_edit, initial);
+        return 0;
+    }
+    case WM_SETFOCUS:
+        if (s_ib_edit) SetFocus(s_ib_edit);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        fill_vertical_gradient(hdc, &rc, TC_BG_SURFACE, TC_BG_DEEP);
+        SetBkMode(hdc, TRANSPARENT);
+        SelectObject(hdc, s_ib_font);
+        SetTextColor(hdc, TC_TEXT_PRIMARY);
+        RECT tr = {20, 16, IB_W - 20, 42};
+        DrawTextW(hdc, s_ib_title, -1, &tr,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(hdc, s_ib_font_sm);
+        SetTextColor(hdc, TC_TEXT_SECONDARY);
+        RECT sr = {20, 44, IB_W - 20, 64};
+        DrawTextW(hdc, L"\u7559\u7a7a\u5219\u663e\u793a\u539f\u59cb\u5185\u5bb9", -1, &sr,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
+        if (di->CtlID == IB_ID_OK || di->CtlID == IB_ID_CANCEL) {
+            int pressed = (di->itemState & ODS_SELECTED) ? 1 : 0;
+            int primary = (di->CtlID == IB_ID_OK);
+            COLORREF top = primary
+                ? (pressed ? TC_ACCENT_DEEP : TC_ACCENT)
+                : (pressed ? TC_BG_CARD : TC_BG_OVERLAY);
+            COLORREF bot = primary
+                ? (pressed ? mix_color(TC_ACCENT_DEEP, TC_BG_ELEVATED, 0.4f) : mix_color(TC_ACCENT, TC_ACCENT_DEEP, 0.3f))
+                : (pressed ? TC_BG_SURFACE : TC_BG_ELEVATED);
+            COLORREF brd = primary
+                ? (pressed ? TC_ACCENT_HOVER : mix_color(TC_ACCENT, TC_ACCENT_HOVER, 0.5f))
+                : (di->itemState & ODS_HOTLIGHT ? TC_BORDER_FOCUS : TC_BORDER_SUBTLE);
+            fill_round_gradient(di->hDC, &di->rcItem, top, bot, 8);
+            draw_round_border(di->hDC, &di->rcItem, brd, 8, 1);
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, primary ? TC_WHITE : TC_TEXT_PRIMARY);
+            SelectObject(di->hDC, s_ib_font);
+            DrawTextW(di->hDC, (di->CtlID == IB_ID_OK) ? L"\u786e\u5b9a" : L"\u53d6\u6d88",
+                      -1, &di->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IB_ID_OK) {
+            GetWindowTextW(s_ib_edit, s_ib_out, ARRAYSIZE(s_ib_out));
+            s_ib_result = INPUTBOX_OK;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wp) == IB_ID_CANCEL) {
+            s_ib_result = INPUTBOX_CANCEL;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        s_ib_result = INPUTBOX_CANCEL;
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (s_ib_font) { DeleteObject(s_ib_font); s_ib_font = NULL; }
+        if (s_ib_font_sm) { DeleteObject(s_ib_font_sm); s_ib_font_sm = NULL; }
+        s_ib_edit = NULL;
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int input_box_show(HWND owner, const wchar_t *title, const wchar_t *prompt,
+                   const wchar_t *initial, wchar_t *out, size_t cch_out) {
+    if (!out || cch_out == 0) return INPUTBOX_CANCEL;
+    out[0] = 0;
+    s_ib_result = INPUTBOX_CANCEL;
+    s_ib_out[0] = 0;
+    wcsncpy_s(s_ib_title, ARRAYSIZE(s_ib_title), title ? title : L"", _TRUNCATE);
+
+    s_ib_dpi = GetDpiForWindow(owner ? owner : GetDesktopWindow());
+    if (s_ib_dpi == 0) s_ib_dpi = 96;
+
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ib_wndproc;
+    wc.hInstance = g_hinst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = L"ClipWheelInputBox";
+    RegisterClassExW(&wc);
+
+    int w = ib_scale(IB_W), h = ib_scale(IB_H);
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = (wa.left + wa.right - w) / 2;
+    int y = (wa.top + wa.bottom - h) / 2;
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"ClipWheelInputBox", L"",
+        WS_POPUP | WS_VISIBLE, x, y, w, h, owner, NULL, g_hinst, (LPVOID)initial);
+    if (!hwnd) return INPUTBOX_CANCEL;
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_QUIT) break;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (s_ib_result == INPUTBOX_OK)
+        wcsncpy_s(out, cch_out, s_ib_out, _TRUNCATE);
+
+    s_ib_edit = NULL;
+    UnregisterClassW(L"ClipWheelInputBox", g_hinst);
+    return s_ib_result;
+}
+
 /* ─── Manager UI ───────────────────────────────────────────────────────────── */
 
 void refresh_manager_lists(void) {
@@ -724,6 +995,9 @@ void refresh_manager_lists(void) {
 
 void sync_settings_controls(void) {
     if (!g_main_hwnd) return;
+    if (g_dark_mode_hwnd)
+        SendMessageW(g_dark_mode_hwnd, BM_SETCHECK,
+                     g_theme == THEME_DARK ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_record_btn_hwnd && !g_recording)
         SetWindowTextW(g_record_btn_hwnd, L"点击开始录制热键");
     if (g_undo_btn_hwnd)
@@ -853,8 +1127,9 @@ void layout_main_window(HWND hwnd) {
     y += QUICK_CARD_H + SECTION_GAP;
     MoveWindow(g_auto_paste_hwnd,    content_left + 16,  y + 12, 260, 26, TRUE);
     MoveWindow(g_floating_mode_hwnd, content_left + 290, y + 12, 240, 26, TRUE);
-    MoveWindow(g_auto_start_hwnd,    content_left + 16,  y + 42, 260, 26, TRUE);
-    MoveWindow(g_record_btn_hwnd,    content_right - 220, y + 20, 220, 38, TRUE);
+    MoveWindow(g_auto_start_hwnd,    content_left + 16,  y + 40, 260, 26, TRUE);
+    MoveWindow(g_dark_mode_hwnd,     content_left + 290, y + 40, 240, 26, TRUE);
+    MoveWindow(g_record_btn_hwnd,    content_right - 220, y + 74, 220, 38, TRUE);
 
     /* 3-column content area */
     y += SETTINGS_H + SECTION_GAP;
@@ -905,9 +1180,9 @@ static void add_list_strings(HWND list_hwnd, int (*copy_fn)(int, wchar_t *, size
 }
 
 void draw_main_window_background(HDC hdc, const RECT *rc) {
-    fill_vertical_gradient(hdc, rc, RGB(8, 10, 16), RGB(11, 11, 16));
-    HBRUSH blob_a = CreateSolidBrush(RGB(21, 26, 45));
-    HBRUSH blob_b = CreateSolidBrush(RGB(16, 18, 34));
+    fill_vertical_gradient(hdc, rc, TC_BG_DEEP, mix_color(TC_BG_DEEP, TC_BG_SURFACE, 0.3f));
+    HBRUSH blob_a = CreateSolidBrush(mix_color(TC_BG_CARD, TC_ACCENT, 0.08f));
+    HBRUSH blob_b = CreateSolidBrush(mix_color(TC_BG_SURFACE, TC_ACCENT, 0.05f));
     HGDIOBJ old_br = SelectObject(hdc, blob_a);
     HGDIOBJ old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
     Ellipse(hdc, rc->right - 420, -120, rc->right + 120, 290);
@@ -920,9 +1195,9 @@ void draw_main_window_background(HDC hdc, const RECT *rc) {
 /* ─── Manager painting helpers ──────────────────────────────────────────────── */
 
 static void draw_nav_bar(HDC hdc, int width, float pulse) {
-    COLORREF accent_live = mix_color(COL_ACCENT, COL_ACCENT_HOVER, pulse * 0.85f);
+    COLORREF accent_live = mix_color(TC_ACCENT, TC_ACCENT_HOVER, pulse * 0.85f);
     RECT nav = {0, 0, width, NAV_H};
-    fill_vertical_gradient(hdc, &nav, RGB(20, 22, 34), RGB(14, 15, 24));
+    fill_vertical_gradient(hdc, &nav, TC_BG_SURFACE, TC_BG_DEEP);
     {
         HPEN lp = CreatePen(PS_SOLID, 2, accent_live);
         HGDIOBJ op = SelectObject(hdc, lp);
@@ -931,7 +1206,7 @@ static void draw_nav_bar(HDC hdc, int width, float pulse) {
         SelectObject(hdc, op); DeleteObject(lp);
     }
     {
-        HPEN dp = CreatePen(PS_SOLID, 1, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.15f));
+        HPEN dp = CreatePen(PS_SOLID, 1, TC_BORDER_SUBTLE);
         HGDIOBJ op = SelectObject(hdc, dp);
         MoveToEx(hdc, 0, NAV_H - 1, NULL);
         LineTo(hdc, width, NAV_H - 1);
@@ -939,39 +1214,39 @@ static void draw_nav_bar(HDC hdc, int width, float pulse) {
     }
     SetBkMode(hdc, TRANSPARENT);
     SelectObject(hdc, g_font_body_bold);
-    SetTextColor(hdc, COL_TEXT_PRIMARY);
+    SetTextColor(hdc, TC_TEXT_PRIMARY);
     RECT line = {CONTENT_PAD + 8, 0, CONTENT_PAD + 160, NAV_H};
     DrawTextW(hdc, L"ClipWheel", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     SelectObject(hdc, g_font_caption);
-    SetTextColor(hdc, COL_TEXT_TERTIARY);
+    SetTextColor(hdc, TC_TEXT_TERTIARY);
     line.left = CONTENT_PAD + 118;
-    DrawTextW(hdc, L"控制中心", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    DrawTextW(hdc, L"\u63a7\u5236\u4e2d\u5fc3", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     RECT hk = {CONTENT_PAD + 220, 10, CONTENT_PAD + 470, NAV_H - 10};
-    fill_round_gradient(hdc, &hk, RGB(34, 36, 52), RGB(24, 26, 40), 10);
-    draw_round_border(hdc, &hk, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.3f), 10, 1);
+    fill_round_gradient(hdc, &hk, TC_BG_ELEVATED, TC_BG_CARD, RADIUS_MD);
+    draw_round_border(hdc, &hk, mix_color(TC_BORDER_DEFAULT, TC_ACCENT, 0.3f), RADIUS_MD, 1);
     SelectObject(hdc, g_font_caption);
-    SetTextColor(hdc, mix_color(COL_ACCENT_GLOW, COL_WHITE, 0.3f + 0.4f * pulse));
+    SetTextColor(hdc, mix_color(TC_ACCENT_GLOW, TC_WHITE, 0.3f + 0.4f * pulse));
     RECT hki = {hk.left + 10, hk.top, hk.right - 6, hk.bottom};
     wchar_t hkl[96];
-    swprintf_s(hkl, ARRAYSIZE(hkl), L"热键: %s", g_hotkey_label);
+    swprintf_s(hkl, ARRAYSIZE(hkl), L"\u70ed\u952e: %s", g_hotkey_label);
     DrawTextW(hdc, hkl, -1, &hki, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 }
 
 static void draw_quick_action_card(HDC hdc, int width, int y) {
     RECT card = {CONTENT_PAD, y, width - CONTENT_PAD, y + QUICK_CARD_H};
-    fill_round_gradient(hdc, &card, RGB(48, 51, 68), RGB(36, 38, 54), 12);
-    draw_round_border(hdc, &card, mix_color(COL_BORDER_SUBTLE, COL_ACCENT_GLOW, 0.2f), 12, 1);
+    fill_round_gradient(hdc, &card, TC_BG_ELEVATED, TC_BG_CARD, RADIUS_LG);
+    draw_round_border(hdc, &card, mix_color(TC_BORDER_SUBTLE, TC_ACCENT_GLOW, 0.2f), RADIUS_LG, 1);
     SelectObject(hdc, g_font_caption);
-    SetTextColor(hdc, COL_TEXT_TERTIARY);
-    RECT line = {card.left + 16, y, card.left + 160, y + QUICK_CARD_H};
-    DrawTextW(hdc, L"快速操作", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SetTextColor(hdc, TC_TEXT_TERTIARY);
+    RECT line = {card.left + SPACE_4, y, card.left + 160, y + QUICK_CARD_H};
+    DrawTextW(hdc, L"\u5feb\u901f\u64cd\u4f5c", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     RECT pill = {width - CONTENT_PAD - 210, y + 14, width - CONTENT_PAD - 16, y + QUICK_CARD_H - 14};
-    COLORREF pc = g_auto_paste ? RGB(28, 70, 52) : RGB(58, 28, 30);
-    COLORREF pb = g_auto_paste ? RGB(52, 211, 153) : RGB(248, 113, 113);
-    fill_round_gradient(hdc, &pill, pc, mix_color(pc, RGB(0, 0, 0), 0.3f), 10);
-    draw_round_border(hdc, &pill, pb, 10, 1);
+    COLORREF pc = g_auto_paste ? TC_SUCCESS_BG : TC_DANGER_BG;
+    COLORREF pb = g_auto_paste ? TC_SUCCESS : TC_DANGER;
+    fill_round_gradient(hdc, &pill, pc, mix_color(pc, TC_BG_DEEP, 0.3f), RADIUS_MD);
+    draw_round_border(hdc, &pill, pb, RADIUS_MD, 1);
     SetTextColor(hdc, pb);
     SelectObject(hdc, g_font_caption);
     DrawTextW(hdc, g_auto_paste ? L"\u81ea\u52a8\u7c98\u8d34 \u2713" : L"\u81ea\u52a8\u7c98\u8d34 \u2717",
@@ -980,11 +1255,11 @@ static void draw_quick_action_card(HDC hdc, int width, int y) {
 
 static void draw_settings_card(HDC hdc, int width, int y, COLORREF accent_live) {
     RECT card = {CONTENT_PAD, y, width - CONTENT_PAD, y + SETTINGS_H};
-    fill_round_gradient(hdc, &card, RGB(42, 44, 60), RGB(30, 32, 48), 12);
-    draw_round_border(hdc, &card, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.18f), 12, 1);
+    fill_round_gradient(hdc, &card, TC_BG_CARD, TC_BG_SURFACE, RADIUS_LG);
+    draw_round_border(hdc, &card, mix_color(TC_BORDER_SUBTLE, TC_ACCENT, 0.18f), RADIUS_LG, 1);
 
     SelectObject(hdc, g_font_title);
-    SetTextColor(hdc, COL_TEXT_PRIMARY);
+    SetTextColor(hdc, TC_TEXT_PRIMARY);
     RECT line = {card.left + 16, y + 10, card.left + 220, y + 40};
     DrawTextW(hdc, L"\u70ed\u952e\u4e0e\u884c\u4e3a", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
@@ -1001,7 +1276,7 @@ static void draw_settings_card(HDC hdc, int width, int y, COLORREF accent_live) 
         wchar_t cur[128];
         swprintf_s(cur, ARRAYSIZE(cur), L"\u5f53\u524d: %s", g_hotkey_label);
         SelectObject(hdc, g_font_caption);
-        SetTextColor(hdc, COL_TEXT_SECONDARY);
+        SetTextColor(hdc, TC_TEXT_SECONDARY);
         line.left = card.right - 320;
         line.right = card.right - 16;
         line.top = y + 10;
@@ -1013,25 +1288,25 @@ static void draw_settings_card(HDC hdc, int width, int y, COLORREF accent_live) 
 static void draw_column_cards(HDC hdc, int width, int height, int y, int right_x) {
     RECT lc = {CONTENT_PAD, y, CONTENT_PAD + g_side_w_left, height - CONTENT_PAD};
     RECT rc = {right_x, y, width - CONTENT_PAD, height - CONTENT_PAD};
-    fill_round_gradient(hdc, &lc, RGB(36, 38, 54), RGB(24, 26, 40), 14);
-    fill_round_gradient(hdc, &rc, RGB(36, 38, 54), RGB(24, 26, 40), 14);
-    draw_round_border(hdc, &lc, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.14f), 14, 1);
-    draw_round_border(hdc, &rc, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.14f), 14, 1);
+    fill_round_gradient(hdc, &lc, TC_BG_CARD, mix_color(TC_BG_SURFACE, TC_BG_DEEP, 0.5f), RADIUS_LG);
+    fill_round_gradient(hdc, &rc, TC_BG_CARD, mix_color(TC_BG_SURFACE, TC_BG_DEEP, 0.5f), RADIUS_LG);
+    draw_round_border(hdc, &lc, TC_BORDER_SUBTLE, RADIUS_LG, 1);
+    draw_round_border(hdc, &rc, TC_BORDER_SUBTLE, RADIUS_LG, 1);
 
     SelectObject(hdc, g_font_title);
-    SetTextColor(hdc, COL_TEXT_PRIMARY);
+    SetTextColor(hdc, TC_TEXT_PRIMARY);
     RECT line = {lc.left + 14, y + 14, lc.right - 100, y + 44};
     DrawTextW(hdc, L"\u56fa\u5b9a\u5185\u5bb9", -1, &line, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     RECT badge = {lc.right - 94, y + 16, lc.right - 10, y + 42};
-    fill_round_gradient(hdc, &badge, RGB(108, 116, 250), RGB(89, 97, 231), 10);
-    draw_round_border(hdc, &badge, COL_ACCENT_GLOW, 10, 1);
-    SetTextColor(hdc, COL_WHITE);
+    fill_round_gradient(hdc, &badge, TC_ACCENT, TC_ACCENT_DEEP, RADIUS_MD);
+    draw_round_border(hdc, &badge, TC_ACCENT_GLOW, RADIUS_MD, 1);
+    SetTextColor(hdc, TC_WHITE);
     SelectObject(hdc, g_font_caption);
     DrawTextW(hdc, L"\u8f6e\u76d8\u4f18\u5148", -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     SelectObject(hdc, g_font_caption);
-    SetTextColor(hdc, COL_TEXT_TERTIARY);
+    SetTextColor(hdc, TC_TEXT_TERTIARY);
     line.top = y + 46;
     line.bottom = y + 68;
     line.right = lc.right - 10;
@@ -1039,7 +1314,7 @@ static void draw_column_cards(HDC hdc, int width, int height, int y, int right_x
               DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     SelectObject(hdc, g_font_title);
-    SetTextColor(hdc, COL_TEXT_PRIMARY);
+    SetTextColor(hdc, TC_TEXT_PRIMARY);
     line.left = rc.left + 14;
     line.top = y + 14;
     line.right = rc.right - 100;
@@ -1050,22 +1325,22 @@ static void draw_column_cards(HDC hdc, int width, int height, int y, int right_x
     badge.top = y + 16;
     badge.right = rc.right - 10;
     badge.bottom = y + 42;
-    fill_round_gradient(hdc, &badge, RGB(108, 116, 250), RGB(89, 97, 231), 10);
-    draw_round_border(hdc, &badge, COL_ACCENT_GLOW, 10, 1);
-    SetTextColor(hdc, COL_WHITE);
+    fill_round_gradient(hdc, &badge, TC_ACCENT, TC_ACCENT_DEEP, RADIUS_MD);
+    draw_round_border(hdc, &badge, TC_ACCENT_GLOW, RADIUS_MD, 1);
+    SetTextColor(hdc, TC_WHITE);
     SelectObject(hdc, g_font_caption);
     DrawTextW(hdc, L"\u81ea\u52a8\u8bb0\u5f55", -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     SelectObject(hdc, g_font_caption);
-    SetTextColor(hdc, COL_TEXT_TERTIARY);
-    line.left = rc.left + 14;
+    SetTextColor(hdc, TC_TEXT_TERTIARY);
+    line.left = rc.left + SPACE_3;
     line.top = y + 46;
     line.bottom = y + 68;
     line.right = rc.right - 10;
     DrawTextW(hdc, L"\u62d6\u5165\u4e2d\u95f4\u8f6e\u76d8\u53ef\u56fa\u5b9a", -1, &line,
               DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-    HPEN sp = CreatePen(PS_SOLID, 1, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.4f));
+    HPEN sp = CreatePen(PS_SOLID, 1, TC_BORDER_DEFAULT);
     HGDIOBJ op = SelectObject(hdc, sp);
     int sy = y, sh = height - CONTENT_PAD - y;
     int sx1 = CONTENT_PAD + g_side_w_left + 6;
@@ -1077,10 +1352,10 @@ static void draw_column_cards(HDC hdc, int width, int height, int y, int right_x
     if (g_manager_search) {
         int sry = rc.top + 72;
         RECT sr = {rc.left + 14, sry, rc.right - 14, sry + 30};
-        fill_round_gradient(hdc, &sr, RGB(58, 60, 78), RGB(46, 48, 64), 8);
-        draw_round_border(hdc, &sr, COL_ACCENT, 8, 1);
+        fill_round_gradient(hdc, &sr, TC_BG_ELEVATED, TC_BG_CARD, 8);
+        draw_round_border(hdc, &sr, TC_ACCENT, 8, 1);
         SelectObject(hdc, g_font_caption);
-        SetTextColor(hdc, COL_TEXT_PRIMARY);
+        SetTextColor(hdc, TC_TEXT_PRIMARY);
         wchar_t disp[280];
         swprintf_s(disp, ARRAYSIZE(disp), L"\u641c\u7d22: %s_", g_manager_search_buf);
         DrawTextW(hdc, disp, -1, &sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1103,11 +1378,12 @@ void paint_main_window(HWND hwnd) {
     int center_w = total_w - g_side_w_left - g_side_w_right - 2 * cg;
     int right_x  = CONTENT_PAD + g_side_w_left + cg + center_w + cg;
     float pulse = 0.5f + 0.5f * (float)sin(g_main_phase);
-    COLORREF accent_live = mix_color(COL_ACCENT, COL_ACCENT_HOVER, pulse * 0.85f);
+    COLORREF accent_live = mix_color(TC_ACCENT, TC_ACCENT_HOVER, pulse * 0.85f);
 
-    fill_vertical_gradient(hdc, &rc, RGB(8, 10, 16), RGB(11, 11, 16));
+    fill_vertical_gradient(hdc, &rc, TC_BG_DEEP, mix_color(TC_BG_DEEP, TC_BG_SURFACE, 0.3f));
     {
-        HBRUSH ba = CreateSolidBrush(RGB(21, 26, 45)), bb = CreateSolidBrush(RGB(16, 18, 34));
+        HBRUSH ba = CreateSolidBrush(mix_color(TC_BG_CARD, TC_ACCENT, 0.08f));
+        HBRUSH bb = CreateSolidBrush(mix_color(TC_BG_SURFACE, TC_ACCENT, 0.05f));
         HGDIOBJ obr = SelectObject(hdc, ba), opn = SelectObject(hdc, GetStockObject(NULL_PEN));
         Ellipse(hdc, width - 380, -80, width + 80, 240);
         SelectObject(hdc, bb);
@@ -1141,17 +1417,17 @@ static LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps; RECT rc, title, sub, brand_bar;
         HDC hdc = BeginPaint(hwnd, &ps);
         GetClientRect(hwnd, &rc);
-        HBRUSH bg = CreateSolidBrush(COL_BG_DEEP); FillRect(hdc, &rc, bg); DeleteObject(bg);
+        HBRUSH bg = CreateSolidBrush(TC_BG_DEEP); FillRect(hdc, &rc, bg); DeleteObject(bg);
         brand_bar.left = 0; brand_bar.top = 0; brand_bar.right = rc.right; brand_bar.bottom = 4;
-        HBRUSH brand = CreateSolidBrush(COL_ACCENT); FillRect(hdc, &brand_bar, brand); DeleteObject(brand);
-        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TEXT_PRIMARY);
+        HBRUSH brand = CreateSolidBrush(TC_ACCENT); FillRect(hdc, &brand_bar, brand); DeleteObject(brand);
+        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, TC_TEXT_PRIMARY);
         SelectObject(hdc, g_font_display);
         title.left = 24; title.top = 20; title.right = rc.right - 24; title.bottom = 66;
         DrawTextW(hdc, L"ClipWheel", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(hdc, g_font_caption); SetTextColor(hdc, COL_TEXT_SECONDARY);
+        SelectObject(hdc, g_font_caption); SetTextColor(hdc, TC_TEXT_SECONDARY);
         sub.left = 24; sub.top = 70; sub.right = rc.right - 24; sub.bottom = 96;
         DrawTextW(hdc, L"启动中...", -1, &sub, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        HPEN decor = CreatePen(PS_SOLID, 2, COL_ACCENT); HGDIOBJ op = SelectObject(hdc, decor);
+        HPEN decor = CreatePen(PS_SOLID, 2, TC_ACCENT); HGDIOBJ op = SelectObject(hdc, decor);
         MoveToEx(hdc, 24, rc.bottom - 8, NULL); LineTo(hdc, 80, rc.bottom - 8);
         SelectObject(hdc, op); DeleteObject(decor);
         EndPaint(hwnd, &ps);
@@ -1182,7 +1458,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         AddClipboardFormatListener(hwnd);
         SetTimer(hwnd, ID_TIMER_POLL, 16, NULL);
-        SetLayeredWindowAttributes(hwnd, 0, (BYTE)242, LWA_ALPHA);
+        SetLayeredWindowAttributes(hwnd, 0, (BYTE)(g_theme == THEME_LIGHT ? 252 : 242), LWA_ALPHA);
         sync_clipboard_now(hwnd);
         return 0;
     case WM_DESTROY:
@@ -1237,7 +1513,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_wheel_appear > 1.0f) g_wheel_appear = 1.0f;
                     need_repaint = 1;
                     SetLayeredWindowAttributes(hwnd, g_floating_mode ? OVERLAY_KEY_COLOR : 0,
-                        (BYTE)((g_floating_mode ? 255.0f : 242.0f) * ease_out_cubicf(g_wheel_appear)),
+                        (BYTE)((g_floating_mode ? 255.0f : (g_theme == THEME_LIGHT ? 252.0f : 242.0f)) * ease_out_cubicf(g_wheel_appear)),
                         g_floating_mode ? (LWA_ALPHA | LWA_COLORKEY) : LWA_ALPHA);
                     alpha_changed = 1;
                 }
@@ -1295,6 +1571,62 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* ─── Inline Rename ────────────────────────────────────────────────────────── */
+
+static void card_list_commit_rename(void) {
+    if (g_rename_pin_index < 0) return;
+    wchar_t new_name[64];
+    GetWindowTextW(g_rename_edit, new_name, ARRAYSIZE(new_name));
+    cw_history_pin_set_display(g_rename_pin_index, new_name);
+    g_rename_pin_index = -1;
+    ShowWindow(g_rename_edit, SW_HIDE);
+    refresh_manager_ui();
+}
+
+static void card_list_cancel_rename(void) {
+    g_rename_pin_index = -1;
+    ShowWindow(g_rename_edit, SW_HIDE);
+}
+
+void card_list_start_rename(HWND parent, int pin_index, int card_y) {
+    if (pin_index < 0 || pin_index >= cw_history_pin_count()) return;
+    g_rename_pin_index = pin_index;
+    g_rename_card_y = card_y;
+    wchar_t cur[64] = L"";
+    cw_history_pin_display(pin_index, cur, ARRAYSIZE(cur));
+    RECT prc;
+    GetClientRect(parent, &prc);
+    int left = 30, right = prc.right - 44;
+    int top = card_y + 38, h = 24;
+    SetWindowPos(g_rename_edit, HWND_TOP, left, top, right - left, h, SWP_SHOWWINDOW);
+    SetWindowTextW(g_rename_edit, cur);
+    SendMessageW(g_rename_edit, EM_SETSEL, 0, -1);
+    SetFocus(g_rename_edit);
+}
+
+LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                 UINT_PTR idSubclass, DWORD_PTR refData) {
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == VK_RETURN) {
+            card_list_commit_rename();
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            card_list_cancel_rename();
+            return 0;
+        }
+        break;
+    case WM_KILLFOCUS:
+        card_list_commit_rename();
+        return 0;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, RenameEditProc, idSubclass);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -1314,6 +1646,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 0,0,0,0,hwnd,(HMENU)CHK_FLOATING_MODE,g_hinst,NULL);
         g_auto_start_hwnd = CreateWindowW(L"BUTTON", L"开机自动启动", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
             0,0,0,0,hwnd,(HMENU)CHK_AUTOSTART,g_hinst,NULL);
+        g_dark_mode_hwnd = CreateWindowW(L"BUTTON", L"暗色模式", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            0,0,0,0,hwnd,(HMENU)CHK_DARK_MODE,g_hinst,NULL);
         g_record_btn_hwnd = CreateWindowW(L"BUTTON", L"点击开始录制热键", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0,0,0,0,hwnd,(HMENU)BTN_RECORD_HOTKEY,g_hinst,NULL);
         g_undo_btn_hwnd = CreateWindowW(L"BUTTON", L"撤销", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,
@@ -1325,14 +1659,31 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowW(L"BUTTON", L"删除", WS_CHILD|WS_VISIBLE|BS_OWNERDRAW, 0,0,0,0,hwnd,(HMENU)BTN_DELETE_HISTORY,g_hinst,NULL);
         g_wheel_preview_hwnd = CreateWindowExW(0, kWheelPreviewClass, NULL,
             WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS, 0,0,0,0,hwnd,NULL,g_hinst,NULL);
+        g_rename_edit = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_WANTRETURN,
+            0, 0, 0, 0, hwnd, NULL, g_hinst, NULL);
+        g_rename_font = create_app_font(FONT_SIZE_RENAME, FW_NORMAL,
+            g_theme == THEME_LIGHT ? FONT_BODY_LIGHT : FONT_BODY_DARK);
+        if (g_rename_edit) {
+            SendMessageW(g_rename_edit, WM_SETFONT, (WPARAM)g_rename_font, TRUE);
+            SetWindowSubclass(g_rename_edit, RenameEditProc, 0, 0);
+        }
         SendMessageW(g_auto_paste_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
         SendMessageW(g_floating_mode_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
         SendMessageW(g_auto_start_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+        SendMessageW(g_dark_mode_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
         SendMessageW(g_record_btn_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+        /* Disable visual styles on checkboxes so WM_CTLCOLORSTATIC controls text color */
+        SetWindowTheme(g_auto_paste_hwnd, L"", L"");
+        SetWindowTheme(g_floating_mode_hwnd, L"", L"");
+        SetWindowTheme(g_auto_start_hwnd, L"", L"");
+        SetWindowTheme(g_dark_mode_hwnd, L"", L"");
         EnableWindow(g_undo_btn_hwnd, FALSE);
         layout_main_window(hwnd);
         refresh_manager_ui();
         SendMessageW(g_auto_start_hwnd, BM_SETCHECK, is_auto_start_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(g_dark_mode_hwnd, BM_SETCHECK,
+            g_theme == THEME_DARK ? BST_CHECKED : BST_UNCHECKED, 0);
         return 0;
     case WM_GETMINMAXINFO: { MINMAXINFO *mmi = (MINMAXINFO *)lp; mmi->ptMinTrackSize.x = 1100; mmi->ptMinTrackSize.y = 700; return 0; }
     case WM_SIZE:
@@ -1440,6 +1791,33 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             save_behavior_config(); return 0;
         case CHK_AUTOSTART:
             set_auto_start(SendMessageW(g_auto_start_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED); return 0;
+        case CHK_DARK_MODE:
+            g_theme = (SendMessageW(g_dark_mode_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                      ? THEME_DARK : THEME_LIGHT;
+            save_behavior_config();
+            destroy_theme_objects();
+            init_theme_objects();
+            /* Update fonts on all controls before repaint */
+            SendMessageW(g_auto_paste_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+            SendMessageW(g_floating_mode_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+            SendMessageW(g_auto_start_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+            SendMessageW(g_dark_mode_hwnd, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+            if (g_rename_edit) {
+                DeleteObject(g_rename_font);
+                g_rename_font = create_app_font(FONT_SIZE_RENAME, FW_NORMAL,
+                    g_theme == THEME_LIGHT ? FONT_BODY_LIGHT : FONT_BODY_DARK);
+                SendMessageW(g_rename_edit, WM_SETFONT, (WPARAM)g_rename_font, TRUE);
+            }
+            /* Force full repaint of all windows */
+            InvalidateRect(hwnd, NULL, TRUE);
+            InvalidateRect(g_auto_paste_hwnd, NULL, TRUE);
+            InvalidateRect(g_floating_mode_hwnd, NULL, TRUE);
+            InvalidateRect(g_auto_start_hwnd, NULL, TRUE);
+            InvalidateRect(g_dark_mode_hwnd, NULL, TRUE);
+            RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE |
+                         RDW_UPDATENOW | RDW_ALLCHILDREN);
+            refresh_manager_ui();
+            return 0;
         case BTN_COPY_PIN: copy_pin_selection(); return 0;
         case BTN_UNPIN: unpin_selected_pin(hwnd); return 0;
         case BTN_COPY_HISTORY: copy_history_selection(); return 0;
@@ -1495,15 +1873,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: {
         HDC hdc = (HDC)wp; HWND ctl = (HWND)lp;
-        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TEXT_PRIMARY);
-        if (ctl == g_auto_paste_hwnd || ctl == g_floating_mode_hwnd || ctl == g_auto_start_hwnd)
-            return (LRESULT)g_brush_dark;
-        return (LRESULT)g_brush_light; }
+        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, TC_TEXT_PRIMARY);
+        if (ctl == g_auto_paste_hwnd || ctl == g_floating_mode_hwnd || ctl == g_auto_start_hwnd || ctl == g_dark_mode_hwnd)
+            return (LRESULT)g_brush_bg_surface;
+        return (LRESULT)g_brush_bg_deep; }
     case WM_PAINT: paint_main_window(hwnd); return 0;
     case WM_ERASEBKGND: {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        fill_vertical_gradient((HDC)wp, &rc, RGB(8, 10, 16), RGB(11, 11, 16));
+        fill_vertical_gradient((HDC)wp, &rc, TC_BG_DEEP, TC_BG_SURFACE);
         return 1;
     }
     case WM_CLOSE: ShowWindow(hwnd, SW_HIDE);
@@ -1621,12 +1999,12 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show) {
 
     wc.lpfnWndProc = OverlayProc; wc.lpszClassName = kOverlayClass;
     RegisterClassExW(&wc);
-    wc.lpfnWndProc = MainProc; wc.lpszClassName = kMainClass; wc.hbrBackground = g_brush_light;
+    wc.lpfnWndProc = MainProc; wc.lpszClassName = kMainClass; wc.hbrBackground = g_brush_bg_deep;
     RegisterClassExW(&wc);
-    wc.lpfnWndProc = CardListProc; wc.lpszClassName = kCardListClass; wc.hbrBackground = g_brush_dark;
+    wc.lpfnWndProc = CardListProc; wc.lpszClassName = kCardListClass; wc.hbrBackground = g_brush_bg_surface;
     wc.style = CS_DBLCLKS;
     RegisterClassExW(&wc);
-    wc.lpfnWndProc = WheelPreviewProc; wc.lpszClassName = kWheelPreviewClass; wc.hbrBackground = g_brush_light;
+    wc.lpfnWndProc = WheelPreviewProc; wc.lpszClassName = kWheelPreviewClass; wc.hbrBackground = g_brush_bg_deep;
     wc.style = 0;
     RegisterClassExW(&wc);
 

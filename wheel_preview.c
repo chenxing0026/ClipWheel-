@@ -2,8 +2,13 @@
 #include "draw_utils.h"
 
 static const COLORREF kPreviewPal[NSECT] = {
-    RGB(91,140,250), RGB(131,108,245), RGB(154,127,255), RGB(76,189,201),
-    RGB(71,162,255), RGB(105,136,249), RGB(121,93,236),  RGB(88,196,161)
+    RGB(99,145,255), RGB(139,110,255), RGB(168,130,255), RGB(80,200,210),
+    RGB(75,175,255), RGB(115,145,255), RGB(130,100,245), RGB(90,210,170)
+};
+
+static const COLORREF kPreviewPalLight[NSECT] = {
+    RGB(204, 120, 92),  RGB(210, 150, 100), RGB(160, 140, 110), RGB(100, 160, 140),
+    RGB(120, 140, 170), RGB(180, 130, 140), RGB(140, 120, 160), RGB(90, 155, 140)
 };
 
 void preview_calc_radii(int w, int h) {
@@ -34,27 +39,29 @@ int preview_sector_from_point(int cx, int cy, int px, int py) {
     return idx;
 }
 
-int preview_x_hit_test(int cx, int cy, int px, int py, int slot_count) {
+int preview_x_hit_test(int cx, int cy, int px, int py, int pin_count) {
     const double pi = 3.14159265358979323846;
     double step = 2.0 * pi / NSECT;
+    (void)pin_count; /* use sector-based lookup instead */
     int x_arm = g_prev_dyn_outer_r - g_prev_dyn_x_btn_r - 2;
     for (int i = 0; i < NSECT; i++) {
-        int slot = sector_to_slot(i);
-        if (slot < 0 || slot >= slot_count) continue;
+        if (sector_to_slot(i) < 0) continue;
+        if (cw_history_find_pin_at_sector(i) < 0) continue;
         double mid = -pi / 2.0 + i * step;
         int bx = cx + (int)(x_arm * cos(mid));
         int by = cy - (int)(x_arm * sin(mid));
         int dx = px - bx, dy = py - by;
-        if (dx * dx + dy * dy <= g_prev_dyn_x_btn_r * g_prev_dyn_x_btn_r) return slot;
+        if (dx * dx + dy * dy <= g_prev_dyn_x_btn_r * g_prev_dyn_x_btn_r) return i;
     }
     return -1;
 }
 
-void preview_do_drop(int target_sector) {
+void preview_do_drop(int target_slot) {
     wchar_t err[256];
-    int pin_count;
-    if (target_sector < 0) return;
-    if (target_sector >= CW_MAX_PIN) target_sector = CW_MAX_PIN - 1;
+    int pin_count, target_sector;
+    if (target_slot < 0) return;
+
+    target_sector = slot_to_sector(target_slot);
 
     if (g_drag_from_kind == CARD_KIND_HISTORY) {
         g_ignore_clip = 1;
@@ -64,12 +71,179 @@ void preview_do_drop(int target_sector) {
     } else {
         pin_count = cw_history_pin_count();
         if (pin_count <= 0) return;
-        if (target_sector >= pin_count) target_sector = pin_count - 1;
-        if (target_sector != g_drag_from_index) {
-            cw_history_reorder_pin(g_drag_from_index, target_sector);
+        if (target_slot >= pin_count) target_slot = pin_count - 1;
+        if (target_slot != g_drag_from_index) {
+            cw_history_reorder_pin(g_drag_from_index, target_slot);
         }
     }
     refresh_manager_ui();
+}
+
+static void draw_preview_header(HDC mem, int w) {
+    RECT hdr = {0, 0, w, 72};
+    fill_vertical_gradient(mem, &hdr, TC_BG_ELEVATED, TC_BG_CARD);
+    HPEN sep = CreatePen(PS_SOLID, 1, TC_BORDER_DEFAULT);
+    HGDIOBJ op = SelectObject(mem, sep);
+    MoveToEx(mem, 0, 72, NULL); LineTo(mem, w, 72);
+    SelectObject(mem, op); DeleteObject(sep);
+
+    SetBkMode(mem, TRANSPARENT);
+    SelectObject(mem, g_font_title);
+    SetTextColor(mem, TC_TEXT_PRIMARY);
+    RECT tl = {16, 10, w - 130, 40};
+    DrawTextW(mem, L"\u53ef\u89c6\u8f6e\u76d8", -1, &tl, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+
+    RECT badge = {w - 118, 12, w - 8, 38};
+    fill_round_gradient(mem, &badge, TC_ACCENT, TC_ACCENT_DEEP, RADIUS_LG);
+    draw_round_border(mem, &badge, TC_ACCENT_GLOW, RADIUS_LG, 1);
+    SelectObject(mem, g_font_caption);
+    SetTextColor(mem, TC_WHITE);
+    DrawTextW(mem, L"\u62d6\u5165\u56fa\u5b9a", -1, &badge, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+
+    RECT sub = {16, 42, w - 8, 68};
+    SetTextColor(mem, TC_TEXT_SECONDARY);
+    DrawTextW(mem, L"\u62d6\u5386\u53f2\u5230\u6247\u533a\u56fa\u5b9a \xb7 \u70b9\u51fb \xd7 \u53d6\u6d88\u56fa\u5b9a \xb7 \u6247\u533a\u95f4\u62d6\u52a8\u53ef\u6392\u5e8f",
+              -1, &sub, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+}
+
+static void draw_preview_wheel_body(HDC mem, int cx, int cy, int outer_r, int inner_r,
+                                     const wchar_t (*slots)[CW_MAX_CHARS]) {
+    const double pi = 3.14159265358979323846;
+    double step = 2.0 * pi / NSECT;
+
+    /* Glow rings */
+    for (int i = 3; i >= 1; i--) {
+        int r = outer_r + i * 12;
+        COLORREF glow = mix_color(TC_ACCENT_GLOW, TC_BG_DEEP, 0.62f + i * 0.10f);
+        HPEN p = CreatePen(PS_SOLID, 1, glow);
+        HGDIOBJ op = SelectObject(mem, p);
+        HGDIOBJ ob = SelectObject(mem, GetStockObject(NULL_BRUSH));
+        Ellipse(mem, cx-r, cy-r, cx+r, cy+r);
+        SelectObject(mem, op); SelectObject(mem, ob); DeleteObject(p);
+    }
+
+    /* Wheel base */
+    {
+        RECT wr = {cx-outer_r, cy-outer_r, cx+outer_r, cy+outer_r};
+        fill_round_gradient(mem, &wr, TC_WHEEL_SECTOR, TC_BG_DEEP, outer_r);
+        draw_round_border(mem, &wr, mix_color(TC_WHEEL_BORDER, TC_ACCENT_HOVER, 0.35f), outer_r, 2);
+    }
+
+    /* Sectors */
+    const COLORREF *pal = g_theme == THEME_LIGHT ? kPreviewPalLight : kPreviewPal;
+    for (int i = 0; i < NSECT; i++) {
+        int slot = sector_to_slot(i);
+        int active = (slot >= 0 && slots[slot][0]);
+        int is_drop_target = (g_drag_active && g_drag_drop_sector == i);
+        float heat = g_prev_sector_heat[i];
+        if (is_drop_target) heat = 1.0f;
+        COLORREF base = pal[i];
+        COLORREF fill_c;
+        if (i == 4) {
+            fill_c = mix_color(TC_CANCEL_SECTOR_A, TC_CANCEL_SECTOR_B, 0.25f + heat * 0.60f);
+        } else {
+            fill_c = active
+                ? mix_color(mix_color(TC_WHEEL_SECTOR, base, 0.30f), base, 0.45f + heat * 0.50f)
+                : (is_drop_target
+                   ? mix_color(TC_WHEEL_SECTOR, base, 0.60f)
+                   : mix_color(TC_WHEEL_SECTOR, TC_WHEEL_BG, 0.5f));
+        }
+        COLORREF border_c = mix_color(TC_WHEEL_BORDER, TC_ACCENT_GLOW, heat * 0.70f);
+        if (i == 4) {
+            border_c = mix_color(TC_CANCEL_BORDER_A, TC_CANCEL_BORDER_B, heat * 0.80f);
+        }
+        HBRUSH br  = CreateSolidBrush(fill_c);
+        HPEN   pen = CreatePen(PS_SOLID, (heat > 0.5f || is_drop_target || i == 4) ? 1 : 0, border_c);
+        HGDIOBJ ob = SelectObject(mem, br);
+        HGDIOBJ op = SelectObject(mem, pen);
+        double t0 = -pi/2.0 + i*step - step/2.0;
+        double t1 = t0 + step;
+        Pie(mem, cx-outer_r, cy-outer_r, cx+outer_r, cy+outer_r,
+            cx+(int)(outer_r*cos(t0)), cy-(int)(outer_r*sin(t0)),
+            cx+(int)(outer_r*cos(t1)), cy-(int)(outer_r*sin(t1)));
+        SelectObject(mem, ob); SelectObject(mem, op);
+        DeleteObject(br); DeleteObject(pen);
+    }
+
+    /* Divider lines */
+    {
+        HPEN div = CreatePen(PS_SOLID, 1, mix_color(TC_BORDER_DEFAULT, TC_BG_DEEP, 0.5f));
+        HGDIOBJ op = SelectObject(mem, div);
+        for (int i = 0; i < NSECT; i++) {
+            double angle = -pi/2.0 + i*step - step/2.0;
+            int x1 = cx + (int)(inner_r * cos(angle));
+            int y1 = cy - (int)(inner_r * sin(angle));
+            int x2 = cx + (int)(outer_r * cos(angle));
+            int y2 = cy - (int)(outer_r * sin(angle));
+            MoveToEx(mem, x1, y1, NULL);
+            LineTo(mem, x2, y2);
+        }
+        SelectObject(mem, op); DeleteObject(div);
+    }
+}
+
+static void draw_preview_hub(HDC mem, int cx, int cy, int inner_r) {
+    RECT hub = {cx-inner_r, cy-inner_r, cx+inner_r, cy+inner_r};
+    fill_round_gradient(mem, &hub, TC_BG_ELEVATED, TC_BG_CARD, inner_r);
+    draw_round_border(mem, &hub, mix_color(TC_ACCENT, TC_ACCENT_GLOW, 0.35f), inner_r, 2);
+    SelectObject(mem, g_font_caption);
+    SetTextColor(mem, g_drag_active ? TC_ACCENT_GLOW : mix_color(TC_TEXT_TERTIARY, TC_TEXT_SECONDARY, 0.4f));
+    DrawTextW(mem, g_drag_active ? L"\u2191" : L"\u2299", -1, &hub, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+}
+
+static void draw_preview_labels(HDC mem, int cx, int cy, int outer_r, int inner_r, int x_btn_r,
+                                 const wchar_t (*slots)[CW_MAX_CHARS],
+                                 const wchar_t (*slot_disp)[64], int pin_count) {
+    const double pi = 3.14159265358979323846;
+    double step = 2.0 * pi / NSECT;
+    int label_r = (inner_r + outer_r) / 2;
+    SelectObject(mem, g_font_caption);
+    for (int i = 0; i < NSECT; i++) {
+        int slot = sector_to_slot(i);
+        double mid = -pi/2.0 + i*step;
+        int mx = cx + (int)(label_r * cos(mid));
+        int my = cy - (int)(label_r * sin(mid));
+        RECT lr = {mx-46, my-12, mx+46, my+12};
+
+        if (i == 4) {
+            SetTextColor(mem, mix_color(TC_CANCEL_TEXT_A, TC_CANCEL_TEXT_B, g_prev_sector_heat[i]));
+            DrawTextW(mem, L"\u2715 \u53d6\u6d88", -1, &lr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        } else if (slot >= 0 && slots[slot][0]) {
+            wchar_t prev[64];
+            truncate_preview(prev, ARRAYSIZE(prev), slot_disp[slot], 8);
+            int hot = (i == g_prev_hover_sector);
+            int drop = (g_drag_active && g_drag_drop_sector == i);
+            SetTextColor(mem, drop  ? TC_SUCCESS :
+                              hot   ? TC_WHITE :
+                                      mix_color(TC_TEXT_TERTIARY, TC_TEXT_PRIMARY, 0.45f));
+            DrawTextW(mem, prev, -1, &lr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+
+            if (cw_history_find_pin_at_sector(i) >= 0) {
+                int x_arm = outer_r - x_btn_r - 2;
+                int bx = cx + (int)(x_arm * cos(mid));
+                int by = cy - (int)(x_arm * sin(mid));
+                int xhot = (g_prev_x_hover_sector == i);
+                COLORREF xfill  = xhot ? TC_X_FILL_HOT : TC_X_FILL;
+                COLORREF xbor   = xhot ? TC_X_BORDER_HOT : TC_X_BORDER;
+                HBRUSH xbr = CreateSolidBrush(xfill);
+                HPEN   xp  = CreatePen(PS_SOLID, 1, xbor);
+                HGDIOBJ xob = SelectObject(mem, xbr);
+                HGDIOBJ xop = SelectObject(mem, xp);
+                Ellipse(mem, bx-x_btn_r, by-x_btn_r, bx+x_btn_r, by+x_btn_r);
+                SelectObject(mem, xob); SelectObject(mem, xop);
+                DeleteObject(xbr); DeleteObject(xp);
+                SetTextColor(mem, xhot ? TC_X_TEXT_HOT : TC_X_TEXT);
+                RECT xr = {bx-x_btn_r, by-x_btn_r, bx+x_btn_r, by+x_btn_r};
+                DrawTextW(mem, L"\xd7", -1, &xr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+            }
+        } else {
+            SetTextColor(mem, g_drag_active
+                ? mix_color(TC_TEXT_TERTIARY, TC_ACCENT_GLOW, 0.5f)
+                : TC_TEXT_TERTIARY);
+            DrawTextW(mem, g_drag_active ? L"+" : L"\xb7", -1, &lr,
+                      DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        }
+    }
 }
 
 void paint_wheel_preview(HWND hwnd) {
@@ -82,161 +256,35 @@ void paint_wheel_preview(HWND hwnd) {
     HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
     HBITMAP old_bmp = (HBITMAP)SelectObject(mem, bmp);
 
-    fill_vertical_gradient(mem, &rc, RGB(22,24,36), RGB(16,17,25));
+    fill_vertical_gradient(mem, &rc, TC_BG_CARD, TC_BG_SURFACE);
 
-    {
-        RECT hdr = {0, 0, w, 72};
-        fill_vertical_gradient(mem, &hdr, RGB(28,30,42), RGB(20,22,32));
-        HPEN sep = CreatePen(PS_SOLID, 1, mix_color(COL_BORDER_SUBTLE, COL_ACCENT, 0.2f));
-        HGDIOBJ op = SelectObject(mem, sep);
-        MoveToEx(mem, 0, 72, NULL); LineTo(mem, w, 72);
-        SelectObject(mem, op); DeleteObject(sep);
-
-        SetBkMode(mem, TRANSPARENT);
-        SelectObject(mem, g_font_title);
-        SetTextColor(mem, COL_TEXT_PRIMARY);
-        RECT tl = {16, 10, w - 130, 40};
-        DrawTextW(mem, L"可视轮盘", -1, &tl, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-
-        RECT badge = {w - 118, 12, w - 8, 38};
-        fill_round_gradient(mem, &badge, RGB(108,116,250), RGB(89,97,231), 12);
-        draw_round_border(mem, &badge, COL_ACCENT_GLOW, 12, 1);
-        SelectObject(mem, g_font_caption);
-        SetTextColor(mem, COL_WHITE);
-        DrawTextW(mem, L"拖入固定", -1, &badge, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-
-        RECT sub = {16, 42, w - 8, 68};
-        SetTextColor(mem, COL_TEXT_SECONDARY);
-        DrawTextW(mem, L"拖历史到扇区固定 \xb7 点击 \xd7 取消固定 \xb7 扇区间拖动可排序",
-                  -1, &sub, DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-    }
+    draw_preview_header(mem, w);
 
     preview_calc_radii(w, h);
     int outer_r = g_prev_dyn_outer_r;
     int inner_r = g_prev_dyn_inner_r;
     int x_btn_r = g_prev_dyn_x_btn_r;
-
     int cx = w / 2;
     int cy = 72 + (h - 72) / 2;
 
     wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS];
+    wchar_t slot_disp[CW_MAX_SLOT][64];
+    ZeroMemory(slots, sizeof(slots));
+    ZeroMemory(slot_disp, sizeof(slot_disp));
     int slot_count = cw_history_fill_slots(slots);
+    cw_history_fill_slot_display(slot_disp);
     int pin_count  = cw_history_pin_count();
 
-    const double pi = 3.14159265358979323846;
-    double step = 2.0 * pi / NSECT;
     int old_mode = SetBkMode(mem, TRANSPARENT);
 
-    for (int i = 3; i >= 1; i--) {
-        int r = outer_r + i * 12;
-        COLORREF glow = mix_color(COL_ACCENT_GLOW, COL_BG_DEEP, 0.62f + i * 0.10f);
-        HPEN p = CreatePen(PS_SOLID, 1, glow);
-        HGDIOBJ op = SelectObject(mem, p);
-        HGDIOBJ ob = SelectObject(mem, GetStockObject(NULL_BRUSH));
-        Ellipse(mem, cx-r, cy-r, cx+r, cy+r);
-        SelectObject(mem, op); SelectObject(mem, ob); DeleteObject(p);
-    }
-
-    {
-        RECT wr = {cx-outer_r, cy-outer_r, cx+outer_r, cy+outer_r};
-        fill_round_gradient(mem, &wr, RGB(28,30,40), RGB(16,17,25), outer_r);
-        draw_round_border(mem, &wr, mix_color(COL_WHEEL_BORDER, COL_ACCENT_HOVER, 0.35f), outer_r, 2);
-    }
-
-    for (int i = 0; i < NSECT; i++) {
-        int slot = sector_to_slot(i);
-        int active = (slot >= 0 && slot < slot_count);
-        int is_drop_target = (g_drag_active && g_drag_drop_sector == i);
-        float heat = g_prev_sector_heat[i];
-        if (is_drop_target) heat = 1.0f;
-        COLORREF base = kPreviewPal[i];
-        COLORREF fill_c;
-        if (i == 4) {
-            fill_c = mix_color(RGB(80, 20, 20), RGB(200, 40, 40), 0.30f + heat * 0.55f);
-        } else {
-            fill_c = active
-                ? mix_color(COL_WHEEL_SECTOR, base, 0.15f + heat * 0.85f)
-                : (is_drop_target
-                   ? mix_color(COL_WHEEL_SECTOR, base, 0.60f)
-                   : mix_color(COL_WHEEL_SECTOR, COL_BG_DEEP, 0.50f));
-        }
-        COLORREF border_c = mix_color(COL_WHEEL_BORDER, COL_WHITE, heat * 0.9f);
-        if (i == 4) border_c = mix_color(RGB(150, 40, 40), RGB(255, 100, 100), heat * 0.9f);
-        HBRUSH br  = CreateSolidBrush(fill_c);
-        HPEN   pen = CreatePen(PS_SOLID, (heat > 0.5f || is_drop_target || i == 4) ? 2 : 1, border_c);
-        HGDIOBJ ob = SelectObject(mem, br);
-        HGDIOBJ op = SelectObject(mem, pen);
-        double t0 = -pi/2.0 + i*step - step/2.0;
-        double t1 = t0 + step;
-        Pie(mem, cx-outer_r, cy-outer_r, cx+outer_r, cy+outer_r,
-            cx+(int)(outer_r*cos(t0)), cy-(int)(outer_r*sin(t0)),
-            cx+(int)(outer_r*cos(t1)), cy-(int)(outer_r*sin(t1)));
-        SelectObject(mem, ob); SelectObject(mem, op);
-        DeleteObject(br); DeleteObject(pen);
-    }
-
-    {
-        RECT hub = {cx-inner_r, cy-inner_r, cx+inner_r, cy+inner_r};
-        fill_round_gradient(mem, &hub, RGB(36,38,52), RGB(23,24,34), inner_r);
-        draw_round_border(mem, &hub, mix_color(COL_ACCENT, COL_ACCENT_GLOW, 0.35f), inner_r, 2);
-        SelectObject(mem, g_font_caption);
-        SetTextColor(mem, g_drag_active ? COL_ACCENT_GLOW : mix_color(COL_TEXT_TERTIARY, COL_TEXT_SECONDARY, 0.4f));
-        DrawTextW(mem, g_drag_active ? L"\u2191" : L"\u2299", -1, &hub, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-    }
-
-    int label_r = (inner_r + outer_r) / 2;
-    SelectObject(mem, g_font_caption);
-    for (int i = 0; i < NSECT; i++) {
-        int slot = sector_to_slot(i);
-        double mid = -pi/2.0 + i*step;
-        int mx = cx + (int)(label_r * cos(mid));
-        int my = cy - (int)(label_r * sin(mid));
-        RECT lr = {mx-46, my-12, mx+46, my+12};
-
-        if (i == 4) {
-            SetTextColor(mem, mix_color(RGB(200, 80, 80), RGB(255, 130, 130), g_prev_sector_heat[i]));
-            DrawTextW(mem, L"\u2715 \u53d6\u6d88", -1, &lr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-        } else if (slot >= 0 && slot < slot_count) {
-            wchar_t prev[20];
-            truncate_preview(prev, ARRAYSIZE(prev), slots[slot], 8);
-            int hot = (i == g_prev_hover_sector);
-            int drop = (g_drag_active && g_drag_drop_sector == i);
-            SetTextColor(mem, drop  ? RGB(160,255,200) :
-                              hot   ? COL_WHITE :
-                                      mix_color(COL_TEXT_TERTIARY, COL_TEXT_PRIMARY, 0.45f));
-            DrawTextW(mem, prev, -1, &lr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
-
-            if (slot < pin_count) {
-                int x_arm = outer_r - x_btn_r - 2;
-                int bx = cx + (int)(x_arm * cos(mid));
-                int by = cy - (int)(x_arm * sin(mid));
-                int xhot = (g_prev_x_hover_sector == i);
-                COLORREF xfill  = xhot ? RGB(244, 63, 94) : RGB(88, 28, 34);
-                COLORREF xbor   = xhot ? RGB(251, 113, 133) : RGB(159, 18, 57);
-                HBRUSH xbr = CreateSolidBrush(xfill);
-                HPEN   xp  = CreatePen(PS_SOLID, 1, xbor);
-                HGDIOBJ xob = SelectObject(mem, xbr);
-                HGDIOBJ xop = SelectObject(mem, xp);
-                Ellipse(mem, bx-x_btn_r, by-x_btn_r, bx+x_btn_r, by+x_btn_r);
-                SelectObject(mem, xob); SelectObject(mem, xop);
-                DeleteObject(xbr); DeleteObject(xp);
-                SetTextColor(mem, xhot ? RGB(255,220,220) : RGB(170,100,100));
-                RECT xr = {bx-x_btn_r, by-x_btn_r, bx+x_btn_r, by+x_btn_r};
-                DrawTextW(mem, L"\xd7", -1, &xr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-            }
-        } else {
-            SetTextColor(mem, g_drag_active
-                ? mix_color(COL_TEXT_TERTIARY, COL_ACCENT_GLOW, 0.5f)
-                : COL_TEXT_TERTIARY);
-            DrawTextW(mem, g_drag_active ? L"+" : L"\xb7", -1, &lr,
-                      DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
-        }
-    }
+    draw_preview_wheel_body(mem, cx, cy, outer_r, inner_r, slots);
+    draw_preview_hub(mem, cx, cy, inner_r);
+    draw_preview_labels(mem, cx, cy, outer_r, inner_r, x_btn_r, slots, slot_disp, pin_count);
 
     if (g_drag_active) {
         RECT dr = {0, h-40, w, h};
-        fill_vertical_gradient(mem, &dr, RGB(0,0,0), RGB(18,22,36));
-        SetTextColor(mem, COL_ACCENT_GLOW);
+        fill_vertical_gradient(mem, &dr, TC_BG_DEEP, TC_BG_SURFACE);
+        SetTextColor(mem, TC_ACCENT_GLOW);
         SelectObject(mem, g_font_caption);
         DrawTextW(mem, L"\u677e\u5f00\u9f20\u6807\u5b8c\u6210\u56fa\u5b9a  \xb7  \u62d6\u81f3\u6700\u4e0b\u65b9\u53d6\u6d88",
                   -1, &dr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
@@ -267,7 +315,11 @@ LRESULT CALLBACK WheelPreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         preview_calc_radii(w, h);
 
         wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS];
+        wchar_t slot_disp[CW_MAX_SLOT][64];
+        ZeroMemory(slots, sizeof(slots));
+        ZeroMemory(slot_disp, sizeof(slot_disp));
         int slot_count = cw_history_fill_slots(slots);
+        cw_history_fill_slot_display(slot_disp);
         int pin_count  = cw_history_pin_count();
 
         POINT pt;
@@ -323,26 +375,30 @@ LRESULT CALLBACK WheelPreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         preview_calc_radii(rc.right - rc.left, rc.bottom - rc.top);
 
         wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS];
+        ZeroMemory(slots, sizeof(slots));
         int slot_count = cw_history_fill_slots(slots);
         int pin_count  = cw_history_pin_count();
 
-        int xslot = preview_x_hit_test(cx, cy, x, y, pin_count);
-        if (xslot >= 0) {
-            cw_history_unpin_display_index(xslot);
-            refresh_manager_ui();
+        int xsec = preview_x_hit_test(cx, cy, x, y, pin_count);
+        if (xsec >= 0) {
+            int pin_idx = cw_history_find_pin_at_sector(xsec);
+            if (pin_idx >= 0) {
+                cw_history_unpin_display_index(pin_idx);
+                refresh_manager_ui();
+            }
             return 0;
         }
 
         int sec = preview_sector_from_point(cx, cy, x, y);
         int slot = sector_to_slot(sec);
-        if (slot >= 0 && slot < pin_count) {
+        int pin_idx = cw_history_find_pin_at_sector(sec);
+        if (slot >= 0 && pin_idx >= 0) {
             g_drag_from_kind  = CARD_KIND_PIN;
-            g_drag_from_index = slot;
+            g_drag_from_index = pin_idx;
             wcsncpy_s(g_drag_text, CW_MAX_CHARS, slots[slot], _TRUNCATE);
             g_drag_pending_start.x = x;
             g_drag_pending_start.y = y;
             g_drag_pending = 1;
-            SetCapture(hwnd);
         }
         (void)slot_count;
         return 0;
@@ -355,6 +411,7 @@ LRESULT CALLBACK WheelPreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (dx*dx + dy*dy > thresh*thresh) {
                 g_drag_pending = 0;
                 g_drag_active  = 1;
+                SetCapture(hwnd);
             }
         }
         if (g_drag_active && GetCapture() == hwnd) {
@@ -415,7 +472,7 @@ LRESULT CALLBACK WheelPreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND: {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        fill_vertical_gradient((HDC)wp, &rc, RGB(22, 24, 36), RGB(16, 17, 25));
+        fill_vertical_gradient((HDC)wp, &rc, TC_BG_CARD, TC_BG_SURFACE);
         return 1;
     }
     }

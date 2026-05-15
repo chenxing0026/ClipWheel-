@@ -7,9 +7,11 @@
 #include <wchar.h>
 
 #define MAGIC 0x43505748u /* 'CPWH' */
-#define VER   1
+#define VER   3
 
 static wchar_t g_pin[CW_MAX_PIN][CW_MAX_CHARS];
+static wchar_t g_pin_display[CW_MAX_PIN][64];
+static int g_pin_sector[CW_MAX_PIN];
 static int g_pin_count;
 
 static wchar_t g_hist[CW_MAX_HIST][CW_MAX_CHARS];
@@ -105,6 +107,7 @@ void cw_history_pin_text(const wchar_t *text) {
 
 int cw_history_pin_text_ex(const wchar_t *text, wchar_t *err, size_t cch_err) {
     wchar_t pin_backup[CW_MAX_PIN][CW_MAX_CHARS];
+    int pin_backup_sector[CW_MAX_PIN];
     int pin_backup_count;
     if (err && cch_err) err[0] = 0;
     if (!text || !text[0]) {
@@ -115,11 +118,21 @@ int cw_history_pin_text_ex(const wchar_t *text, wchar_t *err, size_t cch_err) {
     pin_backup_count = g_pin_count;
     for (int i = 0; i < g_pin_count && i < CW_MAX_PIN; i++) {
         wmemcpy(pin_backup[i], g_pin[i], CW_MAX_CHARS);
+        pin_backup_sector[i] = g_pin_sector[i];
     }
     push_front_text(g_pin, &g_pin_count, CW_MAX_PIN, text);
+    for (int i = g_pin_count - 1; i > 0; i--) {
+        wmemcpy(g_pin_display[i], g_pin_display[i - 1], 64 * sizeof(wchar_t));
+        g_pin_sector[i] = g_pin_sector[i - 1];
+    }
+    g_pin_display[0][0] = 0;
+    g_pin_sector[0] = 0;
     if (!cw_history_save_internal()) {
         g_pin_count = pin_backup_count;
-        for (int k = 0; k < g_pin_count && k < CW_MAX_PIN; k++) wmemcpy(g_pin[k], pin_backup[k], CW_MAX_CHARS);
+        for (int k = 0; k < g_pin_count && k < CW_MAX_PIN; k++) {
+            wmemcpy(g_pin[k], pin_backup[k], CW_MAX_CHARS);
+            g_pin_sector[k] = pin_backup_sector[k];
+        }
         if (err && cch_err) wcsncpy_s(err, cch_err, L"固定失败：保存数据失败（可能无权限或磁盘错误）。", _TRUNCATE);
         cw_logf(L"[pin] save failed (count=%d)", g_pin_count);
         return 0;
@@ -157,8 +170,11 @@ int cw_history_pin_current_clipboard_ex(HWND owner, wchar_t *err, size_t cch_err
 
 void cw_history_unpin_display_index(int display_index) {
     if (display_index < 0 || display_index >= g_pin_count) return;
-    for (int i = display_index; i < g_pin_count - 1; i++)
+    for (int i = display_index; i < g_pin_count - 1; i++) {
         wmemcpy(g_pin[i], g_pin[i + 1], CW_MAX_CHARS);
+        wmemcpy(g_pin_display[i], g_pin_display[i + 1], 64 * sizeof(wchar_t));
+        g_pin_sector[i] = g_pin_sector[i + 1];
+    }
     g_pin_count--;
     if (g_pin_count < 0) g_pin_count = 0;
     cw_history_save();
@@ -176,64 +192,157 @@ void cw_history_delete_history_index(int index) {
 
 void cw_history_clear_all_pins(void) {
     g_pin_count = 0;
+    ZeroMemory(g_pin_sector, sizeof(g_pin_sector));
+    ZeroMemory(g_pin_display, sizeof(g_pin_display));
     cw_history_save();
     cw_logf(L"[pins-clear] ok");
 }
 
 int cw_history_reorder_pin(int from_idx, int to_idx) {
     wchar_t tmp[CW_MAX_CHARS];
+    int tmp_sec;
     if (from_idx < 0 || from_idx >= g_pin_count) return 0;
     if (to_idx < 0 || to_idx >= g_pin_count) return 0;
     if (from_idx == to_idx) return 1;
     wcsncpy_s(tmp, CW_MAX_CHARS, g_pin[from_idx], _TRUNCATE);
+    tmp_sec = g_pin_sector[from_idx];
     if (from_idx < to_idx) {
-        for (int i = from_idx; i < to_idx; i++)
+        for (int i = from_idx; i < to_idx; i++) {
             wmemcpy(g_pin[i], g_pin[i + 1], CW_MAX_CHARS);
+            g_pin_sector[i] = g_pin_sector[i + 1];
+        }
     } else {
-        for (int i = from_idx; i > to_idx; i--)
+        for (int i = from_idx; i > to_idx; i--) {
             wmemcpy(g_pin[i], g_pin[i - 1], CW_MAX_CHARS);
+            g_pin_sector[i] = g_pin_sector[i - 1];
+        }
     }
     wcsncpy_s(g_pin[to_idx], CW_MAX_CHARS, tmp, _TRUNCATE);
+    g_pin_sector[to_idx] = tmp_sec;
     cw_history_save();
     cw_logf(L"[reorder] from=%d to=%d", from_idx, to_idx);
     return 1;
 }
 
-int cw_history_pin_text_at(const wchar_t *text, int position, wchar_t *err, size_t cch_err) {
-    int r = cw_history_pin_text_ex(text, err, cch_err);
-    if (!r) return 0;
-    int target = position;
-    if (target >= g_pin_count) target = g_pin_count - 1;
-    if (target > 0) cw_history_reorder_pin(0, target);
+int cw_history_pin_text_at(const wchar_t *text, int sector, wchar_t *err, size_t cch_err) {
+    int pin_backup_count;
+    int pin_backup_sector[CW_MAX_PIN];
+    wchar_t pin_backup[CW_MAX_PIN][CW_MAX_CHARS];
+    if (err && cch_err) err[0] = 0;
+    if (!text || !text[0]) {
+        if (err && cch_err) wcsncpy_s(err, cch_err, L"剪贴板为空，无法固定。", _TRUNCATE);
+        cw_logf(L"[pin-at] rejected: empty text");
+        return 0;
+    }
+    if (g_pin_count >= CW_MAX_PIN) {
+        if (err && cch_err) wcsncpy_s(err, cch_err, L"固定项已满（最多7个）。", _TRUNCATE);
+        cw_logf(L"[pin-at] rejected: pins full (count=%d)", g_pin_count);
+        return 0;
+    }
+    if (sector < 0 || sector >= CW_NSECT || sector == 4) {
+        if (err && cch_err) wcsncpy_s(err, cch_err, L"无效的扇区位置。", _TRUNCATE);
+        cw_logf(L"[pin-at] rejected: invalid sector=%d", sector);
+        return 0;
+    }
+
+    pin_backup_count = g_pin_count;
+    for (int i = 0; i < g_pin_count && i < CW_MAX_PIN; i++) {
+        wmemcpy(pin_backup[i], g_pin[i], CW_MAX_CHARS);
+        pin_backup_sector[i] = g_pin_sector[i];
+    }
+
+    wcsncpy_s(g_pin[g_pin_count], CW_MAX_CHARS, text, _TRUNCATE);
+    g_pin_display[g_pin_count][0] = 0;
+    g_pin_sector[g_pin_count] = sector;
+    g_pin_count++;
+
+    if (!cw_history_save_internal()) {
+        g_pin_count = pin_backup_count;
+        for (int k = 0; k < g_pin_count && k < CW_MAX_PIN; k++) {
+            wmemcpy(g_pin[k], pin_backup[k], CW_MAX_CHARS);
+            g_pin_sector[k] = pin_backup_sector[k];
+        }
+        if (err && cch_err) wcsncpy_s(err, cch_err, L"固定失败：保存数据失败。", _TRUNCATE);
+        cw_logf(L"[pin-at] save failed (count=%d)", g_pin_count);
+        return 0;
+    }
+    cw_logf(L"[pin-at] ok (count=%d, sector=%d)", g_pin_count, sector);
+    return 1;
+}
+
+int cw_history_pin_sector(int index) {
+    if (index < 0 || index >= g_pin_count) return -1;
+    return g_pin_sector[index];
+}
+
+int cw_history_find_pin_at_sector(int sector) {
+    for (int i = 0; i < g_pin_count; i++) {
+        if (g_pin_sector[i] == sector) return i;
+    }
+    return -1;
+}
+
+int cw_history_pin_set_display(int index, const wchar_t *display) {
+    if (index < 0 || index >= g_pin_count) return 0;
+    if (display && display[0])
+        wcsncpy_s(g_pin_display[index], 64, display, _TRUNCATE);
+    else
+        g_pin_display[index][0] = 0;
+    cw_history_save();
+    cw_logf(L"[pin-display] ok (index=%d)", index);
+    return 1;
+}
+
+int cw_history_pin_display(int index, wchar_t *out, size_t cch_out) {
+    if (!out || cch_out == 0 || index < 0 || index >= g_pin_count) return 0;
+    if (g_pin_display[index][0])
+        wcsncpy_s(out, cch_out, g_pin_display[index], _TRUNCATE);
+    else
+        wcsncpy_s(out, cch_out, g_pin[index], _TRUNCATE);
     return 1;
 }
 
 int cw_history_fill_slots(wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS]) {
     int n = 0;
-    for (int i = 0; i < g_pin_count && n < CW_MAX_SLOT; i++) {
-        wcsncpy_s(slots[n], CW_MAX_CHARS, g_pin[i], _TRUNCATE);
-        n++;
+    for (int i = 0; i < g_pin_count; i++) {
+        int sec = g_pin_sector[i];
+        int s = (sec < 4) ? sec : sec - 1;
+        if (s >= 0 && s < CW_MAX_SLOT && sec != 4) {
+            wcsncpy_s(slots[s], CW_MAX_CHARS, g_pin[i], _TRUNCATE);
+        }
+    }
+    for (int s = 0; s < CW_MAX_SLOT; s++) {
+        if (slots[s][0]) n++;
     }
     for (int h = 0; h < g_hist_count && n < CW_MAX_SLOT; h++) {
         int dup = 0;
         for (int p = 0; p < g_pin_count; p++) {
-            if (wcs_same(g_hist[h], g_pin[p])) {
-                dup = 1;
-                break;
-            }
+            if (wcs_same(g_hist[h], g_pin[p])) { dup = 1; break; }
         }
         if (dup) continue;
-        for (int s = 0; s < n; s++) {
-            if (wcs_same(g_hist[h], slots[s])) {
-                dup = 1;
-                break;
-            }
+        for (int s = 0; s < CW_MAX_SLOT; s++) {
+            if (slots[s][0] && wcs_same(g_hist[h], slots[s])) { dup = 1; break; }
         }
         if (dup) continue;
-        wcsncpy_s(slots[n], CW_MAX_CHARS, g_hist[h], _TRUNCATE);
-        n++;
+        for (int s = 0; s < CW_MAX_SLOT; s++) {
+            if (!slots[s][0]) { wcsncpy_s(slots[s], CW_MAX_CHARS, g_hist[h], _TRUNCATE); n++; break; }
+        }
     }
     return n;
+}
+
+int cw_history_fill_slot_display(wchar_t display[CW_MAX_SLOT][64]) {
+    for (int i = 0; i < g_pin_count; i++) {
+        int sec = g_pin_sector[i];
+        int s = (sec < 4) ? sec : sec - 1;
+        if (s >= 0 && s < CW_MAX_SLOT && sec != 4) {
+            if (g_pin_display[i][0])
+                wcsncpy_s(display[s], 64, g_pin_display[i], _TRUNCATE);
+            else
+                truncate_preview(display[s], 64, g_pin[i], 26);
+        }
+    }
+    return 1;
 }
 
 int cw_history_pin_count(void) {
@@ -260,6 +369,7 @@ void cw_history_load(void) {
     ensure_paths();
     g_pin_count = 0;
     g_hist_count = 0;
+    ZeroMemory(g_pin_sector, sizeof(g_pin_sector));
     FILE *f = NULL;
     wchar_t bak[MAX_PATH];
     swprintf_s(bak, MAX_PATH, L"%s.bak", g_data_file);
@@ -275,14 +385,14 @@ void cw_history_load(void) {
             return;
         }
     }
-    if (fread(&ver, 4, 1, f) != 1 || ver != VER) {
+    if (fread(&ver, 4, 1, f) != 1 || ver > VER) {
         fclose(f);
         if (_wfopen_s(&f, bak, L"rb") != 0 || !f) return;
         if (fread(&magic, 4, 1, f) != 1 || magic != MAGIC) {
             fclose(f);
             return;
         }
-        if (fread(&ver, 4, 1, f) != 1 || ver != VER) {
+        if (fread(&ver, 4, 1, f) != 1 || ver > VER) {
             fclose(f);
             return;
         }
@@ -293,6 +403,7 @@ void cw_history_load(void) {
     }
     if (np > CW_MAX_PIN) np = CW_MAX_PIN;
     if (nh > CW_MAX_HIST) nh = CW_MAX_HIST;
+    uint32_t pin_idx = 0;
     for (uint32_t i = 0; i < np; i++) {
         uint32_t bl = 0;
         if (fread(&bl, 4, 1, f) != 1) break;
@@ -302,7 +413,35 @@ void cw_history_load(void) {
         size_t nch = bl / sizeof(wchar_t);
         if (nch >= CW_MAX_CHARS) nch = CW_MAX_CHARS - 1;
         g_pin[g_pin_count][nch] = 0;
+        if (ver >= 2) {
+            uint32_t sec = 0;
+            if (fread(&sec, 4, 1, f) != 1) break;
+            g_pin_sector[g_pin_count] = (int)sec;
+        } else {
+            g_pin_sector[g_pin_count] = (int)pin_idx;
+        }
+        if (ver >= 3) {
+            uint32_t dl = 0;
+            if (fread(&dl, 4, 1, f) != 1) break;
+            if (dl > 0 && dl < 64 * (uint32_t)sizeof(wchar_t)) {
+                if (fread(g_pin_display[g_pin_count], 1, dl, f) != dl) break;
+                size_t dch = dl / sizeof(wchar_t);
+                if (dch >= 64) dch = 63;
+                g_pin_display[g_pin_count][dch] = 0;
+            } else {
+                g_pin_display[g_pin_count][0] = 0;
+                if (dl > 0) {
+                    /* Discard oversized display data without corrupting the buffer */
+                    char discard_buf[128];
+                    size_t to_skip = dl < sizeof(discard_buf) ? dl : sizeof(discard_buf);
+                    if (fread(discard_buf, 1, to_skip, f) < to_skip && ferror(f)) break;
+                }
+            }
+        } else {
+            g_pin_display[g_pin_count][0] = 0;
+        }
         g_pin_count++;
+        pin_idx++;
     }
     for (uint32_t i = 0; i < nh; i++) {
         uint32_t bl = 0;
@@ -342,7 +481,11 @@ static int cw_history_save_internal(void) {
     }
     for (int i = 0; i < g_pin_count; i++) {
         uint32_t bl = (uint32_t)((wcslen(g_pin[i]) + 1) * sizeof(wchar_t));
-        if (fwrite(&bl, 4, 1, f) != 1 || fwrite(g_pin[i], 1, bl, f) != bl) {
+        uint32_t sec = (uint32_t)g_pin_sector[i];
+        uint32_t dl = (uint32_t)((wcslen(g_pin_display[i]) + 1) * sizeof(wchar_t));
+        if (fwrite(&bl, 4, 1, f) != 1 || fwrite(g_pin[i], 1, bl, f) != bl ||
+            fwrite(&sec, 4, 1, f) != 1 || fwrite(&dl, 4, 1, f) != 1 ||
+            fwrite(g_pin_display[i], 1, dl, f) != dl) {
             fclose(f);
             DeleteFileW(tmp);
             cw_logf(L"[save] pin write failed");
@@ -411,48 +554,76 @@ int cw_history_selftest(void) {
     {
         wchar_t err[256];
         if (!cw_history_pin_text_at(L"ONE", 0, err, ARRAYSIZE(err))) return 0;
-        if (!cw_history_pin_text_at(L"TWO", 0, err, ARRAYSIZE(err))) return 0;
+        if (!cw_history_pin_text_at(L"TWO", 1, err, ARRAYSIZE(err))) return 0;
         if (!cw_history_pin_text_at(L"THREE", 2, err, ARRAYSIZE(err))) return 0;
         if (g_pin_count != 3) return 0;
-        if (wcscmp(g_pin[0], L"TWO") != 0) return 0;
-        if (wcscmp(g_pin[1], L"ONE") != 0) return 0;
+        if (wcscmp(g_pin[0], L"ONE") != 0) return 0;
+        if (wcscmp(g_pin[1], L"TWO") != 0) return 0;
         if (wcscmp(g_pin[2], L"THREE") != 0) return 0;
         if (!cw_history_reorder_pin(2, 0)) return 0;
         if (wcscmp(g_pin[0], L"THREE") != 0) return 0;
-        if (wcscmp(g_pin[1], L"TWO") != 0) return 0;
-        if (wcscmp(g_pin[2], L"ONE") != 0) return 0;
+        if (wcscmp(g_pin[1], L"ONE") != 0) return 0;
+        if (wcscmp(g_pin[2], L"TWO") != 0) return 0;
     }
 
     cw_history_clear_all_pins();
     if (g_pin_count != 0) return 0;
 
-    cw_history_on_copy(L"hist-alpha");
-    cw_history_on_copy(L"hist-beta");
-    cw_history_on_copy(L"hist-gamma");
-    if (g_hist_count != 3) return 0;
-    if (wcscmp(g_hist[0], L"hist-gamma") != 0) return 0;
-    if (wcscmp(g_hist[1], L"hist-beta") != 0) return 0;
-
-    cw_history_on_copy(L"hist-gamma");
-    if (g_hist_count != 3) return 0;
-
     {
+        wchar_t err[256] = {0};
+        int r;
+        r = cw_history_pin_text_at(L"at-s3", 3, err, ARRAYSIZE(err));
+        if (!r || g_pin_count != 1 || cw_history_pin_sector(0) != 3) return 0;
+        r = cw_history_pin_text_at(L"at-s1", 1, err, ARRAYSIZE(err));
+        if (!r || g_pin_count != 2 || cw_history_pin_sector(1) != 1) return 0;
+        r = cw_history_pin_text_at(L"at-s5", 5, err, ARRAYSIZE(err));
+        if (!r || g_pin_count != 3 || cw_history_pin_sector(2) != 5) return 0;
+
         wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS];
+        ZeroMemory(slots, sizeof(slots));
         int n = cw_history_fill_slots(slots);
         if (n != 3) return 0;
-        if (wcscmp(slots[0], L"hist-gamma") != 0) return 0;
-        if (wcscmp(slots[1], L"hist-beta") != 0) return 0;
-        if (wcscmp(slots[2], L"hist-alpha") != 0) return 0;
+        if (wcscmp(slots[3], L"at-s3") != 0) return 0;
+        if (wcscmp(slots[1], L"at-s1") != 0) return 0;
+        if (wcscmp(slots[4], L"at-s5") != 0) return 0;
+
+        cw_history_unpin_display_index(1);
+        if (g_pin_count != 2) return 0;
+        if (cw_history_pin_sector(0) != 3) return 0;
+        if (cw_history_pin_sector(1) != 5) return 0;
     }
 
-    cw_history_delete_history_index(1);
-    if (g_hist_count != 2) return 0;
-    if (wcscmp(g_hist[0], L"hist-gamma") != 0) return 0;
-    if (wcscmp(g_hist[1], L"hist-alpha") != 0) return 0;
+    cw_history_clear_all_pins();
+    {
+        wchar_t err[256];
+        if (!cw_history_pin_text_at(L"raw-password", 1, err, ARRAYSIZE(err))) return 0;
+        if (!cw_history_pin_set_display(0, L"my password")) return 0;
+        if (!cw_history_pin_display(0, err, ARRAYSIZE(err))) return 0;
+        if (wcscmp(err, L"my password") != 0) return 0;
 
-    cw_history_delete_history_index(0);
-    cw_history_delete_history_index(0);
-    if (g_hist_count != 0) return 0;
+        wchar_t slots[CW_MAX_SLOT][CW_MAX_CHARS];
+        wchar_t disp[CW_MAX_SLOT][64];
+        ZeroMemory(slots, sizeof(slots));
+        ZeroMemory(disp, sizeof(disp));
+        cw_history_fill_slots(slots);
+        cw_history_fill_slot_display(disp);
+        if (wcscmp(slots[1], L"raw-password") != 0) return 0;
+        if (wcscmp(disp[1], L"my password") != 0) return 0;
+
+        cw_history_save();
+        g_pin_count = 0;
+        ZeroMemory(g_pin_sector, sizeof(g_pin_sector));
+        ZeroMemory(g_pin_display, sizeof(g_pin_display));
+        cw_history_load();
+        if (g_pin_count != 1) return 0;
+        if (wcscmp(g_pin[0], L"raw-password") != 0) return 0;
+        if (wcscmp(g_pin_display[0], L"my password") != 0) return 0;
+
+        cw_history_pin_set_display(0, L"");
+        if (g_pin_display[0][0] != 0) return 0;
+        cw_history_pin_display(0, err, ARRAYSIZE(err));
+        if (wcscmp(err, L"raw-password") != 0) return 0;
+    }
 
     return 1;
 }

@@ -73,7 +73,7 @@ version 1, pins first then history). Log to `%APPDATA%\ClipWheel\clipwheel.log`.
 
 ## Version
 
-Defined as `CLIPWHEEL_VERSION L"2.1.0"` in `main.c`. Must be updated by hand when bumping.
+Defined as `CLIPWHEEL_VERSION L"2.3.0"` in `app.h`. Must be updated by hand when bumping.
 
 ## Conventions / gotchas
 

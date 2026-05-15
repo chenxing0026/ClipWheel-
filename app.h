@@ -9,6 +9,8 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <commctrl.h>
+#include <uxtheme.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,31 +25,233 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "uxtheme.lib")
+
+#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef ARRAYSIZE
 #define ARRAYSIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif
 
-/* ─── Color system ─────────────────────────────────────────────────────── */
-#define COL_WHITE          RGB(255, 255, 255)
-#define COL_ACCENT         RGB(99, 102, 241)
-#define COL_ACCENT_HOVER   RGB(129, 140, 248)
-#define COL_ACCENT_GLOW    RGB(199, 210, 254)
-#define COL_TEXT_TERTIARY  RGB(113, 113, 122)
+/* ─── Design Tokens: Surface Elevation ──────────────────────────────────── */
+/* 60% dominant: backgrounds, 30% secondary: cards, 10% accent: highlights  */
+#define COL_BG_DEEP        RGB(9, 9, 11)       /* deepest layer */
+#define COL_BG_SURFACE     RGB(15, 16, 22)      /* page background */
+#define COL_BG_CARD        RGB(22, 23, 34)      /* card surfaces */
+#define COL_BG_ELEVATED    RGB(30, 31, 44)      /* elevated cards, hover */
+#define COL_BG_OVERLAY     RGB(38, 39, 54)      /* overlays, dropdowns */
 
+/* ─── Design Tokens: Accent (Indigo) ───────────────────────────────────── */
+#define COL_ACCENT         RGB(99, 102, 241)    /* primary accent */
+#define COL_ACCENT_HOVER   RGB(129, 140, 248)   /* accent hover */
+#define COL_ACCENT_GLOW    RGB(199, 210, 254)   /* accent glow/ring */
+#define COL_ACCENT_DEEP    RGB(67, 70, 200)     /* accent pressed */
+
+/* ─── Design Tokens: Text ──────────────────────────────────────────────── */
+#define COL_TEXT_PRIMARY   RGB(250, 250, 250)   /* headings, primary */
+#define COL_TEXT_SECONDARY RGB(163, 163, 174)   /* body, descriptions */
+#define COL_TEXT_TERTIARY  RGB(113, 113, 122)   /* captions, hints */
+#define COL_TEXT_DISABLED  RGB(75, 75, 85)      /* disabled states */
+#define COL_WHITE          RGB(255, 255, 255)
+
+/* ─── Design Tokens: Border ────────────────────────────────────────────── */
+#define COL_BORDER_SUBTLE  RGB(45, 46, 58)      /* card borders */
+#define COL_BORDER_DEFAULT RGB(55, 56, 70)      /* visible borders */
+#define COL_BORDER_FOCUS   RGB(129, 140, 248)   /* focus ring */
+
+/* ─── Design Tokens: Status ────────────────────────────────────────────── */
+#define COL_SUCCESS        RGB(52, 211, 153)    /* green: auto-paste on */
+#define COL_SUCCESS_BG     RGB(28, 70, 52)
+#define COL_DANGER         RGB(248, 113, 113)   /* red: errors, cancel */
+#define COL_DANGER_BG      RGB(58, 28, 30)
+#define COL_DANGER_DEEP    RGB(200, 80, 80)     /* red: cancel zone */
+
+/* ─── Design Tokens: Wheel ─────────────────────────────────────────────── */
 #define COL_WHEEL_BG       RGB(15, 15, 18)
 #define COL_WHEEL_SECTOR   RGB(35, 35, 40)
 #define COL_WHEEL_BORDER   RGB(71, 85, 105)
-#define COL_WHEEL_HIGHLIGHT RGB(167, 139, 250)
-#define COL_WHEEL_GLOW     RGB(99, 102, 241)
+#define COL_WHEEL_GLOW     COL_ACCENT
 
-#define COL_BG_DEEP        RGB(9, 9, 11)
-#define COL_BG_SURFACE     RGB(18, 18, 24)
-#define COL_BG_CARD        RGB(39, 39, 42)
-#define COL_BORDER_SUBTLE  RGB(39, 39, 42)
-#define COL_BORDER_FOCUS   RGB(129, 140, 248)
-#define COL_TEXT_PRIMARY   RGB(250, 250, 250)
-#define COL_TEXT_SECONDARY RGB(163, 163, 174)
+/* ─── Cancel zone ──────────────────────────────────────────────────────── */
+#define COL_CANCEL_SECTOR_A   RGB(90, 25, 25)
+#define COL_CANCEL_SECTOR_B   RGB(200, 55, 55)
+#define COL_CANCEL_BORDER_A   RGB(160, 45, 45)
+#define COL_CANCEL_BORDER_B   RGB(255, 110, 110)
+#define COL_CANCEL_PILL_A1    RGB(50, 15, 15)
+#define COL_CANCEL_PILL_A2    RGB(70, 20, 20)
+#define COL_CANCEL_PILL_B     RGB(30, 10, 10)
+#define COL_CANCEL_PILL_BRD_A RGB(120, 40, 40)
+#define COL_CANCEL_PILL_BRD_B RGB(200, 80, 80)
+#define COL_CANCEL_TEXT_A     RGB(200, 80, 80)
+#define COL_CANCEL_TEXT_B     RGB(255, 130, 130)
+
+/* ─── X button (unpin) ──────────────────────────────────────────────────── */
+#define COL_X_FILL_HOT    RGB(244, 63, 94)
+#define COL_X_FILL        RGB(88, 28, 34)
+#define COL_X_BORDER_HOT  RGB(251, 113, 133)
+#define COL_X_BORDER      RGB(159, 18, 57)
+#define COL_X_TEXT_HOT    RGB(255, 220, 220)
+#define COL_X_TEXT        RGB(170, 100, 100)
+
+/* ─── Label pill subtitle ───────────────────────────────────────────────── */
+#define COL_LABEL_SUBTLE  RGB(200, 205, 220)
+
+/* ─── Theme mode ──────────────────────────────────────────────────────────── */
+typedef enum { THEME_DARK = 0, THEME_LIGHT = 1 } ThemeMode;
+extern ThemeMode g_theme;
+
+/* ─── Design Tokens: Light Theme (Claude.com warm editorial) ─────────────── */
+
+/* Surface — warm cream hierarchy */
+#define COL_L_CANVAS         RGB(250, 249, 245)  /* #faf9f5 — page floor */
+#define COL_L_SURFACE        RGB(239, 233, 222)  /* #efe9de — card surface */
+#define COL_L_CARD           RGB(245, 243, 238)  /* elevated card */
+#define COL_L_ELEVATED       RGB(232, 225, 213)  /* #e8e1d5 — hover shelf */
+#define COL_L_OVERLAY        RGB(255, 255, 255)  /* highest overlay */
+#define COL_L_BG_DEEPEST     RGB(242, 239, 233)  /* deepest light bg */
+
+/* Accent — Anthropic coral */
+#define COL_L_ACCENT         RGB(204, 120, 92)   /* #cc785c */
+#define COL_L_ACCENT_HOVER   RGB(224, 140, 112)  /* lighter coral */
+#define COL_L_ACCENT_GLOW    RGB(240, 200, 180)  /* coral glow */
+#define COL_L_ACCENT_DEEP    RGB(184, 100, 72)   /* pressed coral */
+
+/* Text — warm ink */
+#define COL_L_INK            RGB(20, 20, 19)     /* #141413 — headlines */
+#define COL_L_BODY           RGB(61, 61, 58)     /* #3d3d3a — running text */
+#define COL_L_MUTED          RGB(90, 88, 83)     /* #5a5853 — captions, 4.8:1 on surface */
+#define COL_L_DISABLED       RGB(180, 177, 171)  /* disabled text */
+#define COL_L_WHITE          RGB(255, 255, 255)
+
+/* Border */
+#define COL_L_BORDER_SUBTLE  RGB(220, 215, 205)
+#define COL_L_BORDER_DEFAULT RGB(200, 193, 182)
+#define COL_L_BORDER_FOCUS   COL_L_ACCENT
+
+/* Status */
+#define COL_L_SUCCESS        RGB(34, 130, 90)
+#define COL_L_SUCCESS_BG     RGB(220, 245, 228)
+#define COL_L_DANGER         RGB(210, 60, 50)
+#define COL_L_DANGER_BG      RGB(250, 228, 225)
+#define COL_L_DANGER_DEEP    RGB(185, 40, 30)
+
+/* Wheel */
+#define COL_L_WHEEL_BG       RGB(245, 243, 240)
+#define COL_L_WHEEL_SECTOR   RGB(250, 249, 246)
+#define COL_L_WHEEL_BORDER   RGB(200, 195, 188)
+#define COL_L_WHEEL_CANCEL   RGB(220, 80, 70)
+
+/* Cancel zone — light */
+#define COL_L_CANCEL_SECTOR_A   RGB(250, 210, 205)
+#define COL_L_CANCEL_SECTOR_B   RGB(235, 160, 150)
+#define COL_L_CANCEL_BORDER_A   RGB(210, 120, 110)
+#define COL_L_CANCEL_BORDER_B   RGB(240, 160, 150)
+#define COL_L_CANCEL_PILL_A1    RGB(250, 215, 210)
+#define COL_L_CANCEL_PILL_A2    RGB(240, 190, 180)
+#define COL_L_CANCEL_PILL_B     RGB(245, 225, 220)
+#define COL_L_CANCEL_PILL_BRD_A RGB(220, 140, 130)
+#define COL_L_CANCEL_PILL_BRD_B RGB(235, 160, 150)
+#define COL_L_CANCEL_TEXT_A     RGB(210, 80, 70)
+#define COL_L_CANCEL_TEXT_B     RGB(235, 130, 120)
+
+/* X button — light */
+#define COL_L_X_FILL_HOT    RGB(210, 80, 85)
+#define COL_L_X_FILL        RGB(245, 210, 208)
+#define COL_L_X_BORDER_HOT  RGB(220, 110, 110)
+#define COL_L_X_BORDER      RGB(190, 85, 85)
+#define COL_L_X_TEXT_HOT    RGB(180, 60, 60)
+#define COL_L_X_TEXT        RGB(150, 90, 90)
+
+/* Label subtitle — light */
+#define COL_L_LABEL_SUBTLE  RGB(80, 78, 72)
+
+/* ─── Theme-Aware Proxy Macros ────────────────────────────────────────────── */
+/* Drawing code uses TC_* exclusively; the proxy selects light/dark at compile
+   time based on g_theme. No per-function if/else needed. */
+
+#define TC_BG_DEEP      (g_theme == THEME_LIGHT ? COL_L_CANVAS      : COL_BG_DEEP)
+#define TC_BG_SURFACE   (g_theme == THEME_LIGHT ? COL_L_SURFACE     : COL_BG_SURFACE)
+#define TC_BG_CARD      (g_theme == THEME_LIGHT ? COL_L_CARD        : COL_BG_CARD)
+#define TC_BG_ELEVATED  (g_theme == THEME_LIGHT ? COL_L_ELEVATED    : COL_BG_ELEVATED)
+#define TC_BG_OVERLAY   (g_theme == THEME_LIGHT ? COL_L_OVERLAY     : COL_BG_OVERLAY)
+#define TC_BG_DEEPEST   (g_theme == THEME_LIGHT ? COL_L_BG_DEEPEST  : COL_BG_DEEP)
+
+#define TC_ACCENT       (g_theme == THEME_LIGHT ? COL_L_ACCENT       : COL_ACCENT)
+#define TC_ACCENT_HOVER (g_theme == THEME_LIGHT ? COL_L_ACCENT_HOVER : COL_ACCENT_HOVER)
+#define TC_ACCENT_GLOW  (g_theme == THEME_LIGHT ? COL_L_ACCENT_GLOW  : COL_ACCENT_GLOW)
+#define TC_ACCENT_DEEP  (g_theme == THEME_LIGHT ? COL_L_ACCENT_DEEP  : COL_ACCENT_DEEP)
+
+#define TC_TEXT_PRIMARY   (g_theme == THEME_LIGHT ? COL_L_INK      : COL_TEXT_PRIMARY)
+#define TC_TEXT_SECONDARY (g_theme == THEME_LIGHT ? COL_L_BODY     : COL_TEXT_SECONDARY)
+#define TC_TEXT_TERTIARY  (g_theme == THEME_LIGHT ? COL_L_MUTED    : COL_TEXT_TERTIARY)
+#define TC_TEXT_DISABLED  (g_theme == THEME_LIGHT ? COL_L_DISABLED : COL_TEXT_DISABLED)
+#define TC_WHITE          (g_theme == THEME_LIGHT ? COL_L_WHITE    : COL_WHITE)
+
+#define TC_BORDER_SUBTLE  (g_theme == THEME_LIGHT ? COL_L_BORDER_SUBTLE  : COL_BORDER_SUBTLE)
+#define TC_BORDER_DEFAULT (g_theme == THEME_LIGHT ? COL_L_BORDER_DEFAULT : COL_BORDER_DEFAULT)
+#define TC_BORDER_FOCUS   (g_theme == THEME_LIGHT ? COL_L_BORDER_FOCUS   : COL_BORDER_FOCUS)
+
+#define TC_SUCCESS        (g_theme == THEME_LIGHT ? COL_L_SUCCESS     : COL_SUCCESS)
+#define TC_SUCCESS_BG     (g_theme == THEME_LIGHT ? COL_L_SUCCESS_BG  : COL_SUCCESS_BG)
+#define TC_DANGER         (g_theme == THEME_LIGHT ? COL_L_DANGER      : COL_DANGER)
+#define TC_DANGER_BG      (g_theme == THEME_LIGHT ? COL_L_DANGER_BG   : COL_DANGER_BG)
+#define TC_DANGER_DEEP    (g_theme == THEME_LIGHT ? COL_L_DANGER_DEEP : COL_DANGER_DEEP)
+
+#define TC_WHEEL_BG       (g_theme == THEME_LIGHT ? COL_L_WHEEL_BG     : COL_WHEEL_BG)
+#define TC_WHEEL_SECTOR   (g_theme == THEME_LIGHT ? COL_L_WHEEL_SECTOR : COL_WHEEL_SECTOR)
+#define TC_WHEEL_BORDER   (g_theme == THEME_LIGHT ? COL_L_WHEEL_BORDER : COL_WHEEL_BORDER)
+
+#define TC_CANCEL_SECTOR_A   (g_theme == THEME_LIGHT ? COL_L_CANCEL_SECTOR_A   : COL_CANCEL_SECTOR_A)
+#define TC_CANCEL_SECTOR_B   (g_theme == THEME_LIGHT ? COL_L_CANCEL_SECTOR_B   : COL_CANCEL_SECTOR_B)
+#define TC_CANCEL_BORDER_A   (g_theme == THEME_LIGHT ? COL_L_CANCEL_BORDER_A   : COL_CANCEL_BORDER_A)
+#define TC_CANCEL_BORDER_B   (g_theme == THEME_LIGHT ? COL_L_CANCEL_BORDER_B   : COL_CANCEL_BORDER_B)
+#define TC_CANCEL_PILL_A1    (g_theme == THEME_LIGHT ? COL_L_CANCEL_PILL_A1    : COL_CANCEL_PILL_A1)
+#define TC_CANCEL_PILL_A2    (g_theme == THEME_LIGHT ? COL_L_CANCEL_PILL_A2    : COL_CANCEL_PILL_A2)
+#define TC_CANCEL_PILL_B     (g_theme == THEME_LIGHT ? COL_L_CANCEL_PILL_B     : COL_CANCEL_PILL_B)
+#define TC_CANCEL_PILL_BRD_A (g_theme == THEME_LIGHT ? COL_L_CANCEL_PILL_BRD_A : COL_CANCEL_PILL_BRD_A)
+#define TC_CANCEL_PILL_BRD_B (g_theme == THEME_LIGHT ? COL_L_CANCEL_PILL_BRD_B : COL_CANCEL_PILL_BRD_B)
+#define TC_CANCEL_TEXT_A     (g_theme == THEME_LIGHT ? COL_L_CANCEL_TEXT_A     : COL_CANCEL_TEXT_A)
+#define TC_CANCEL_TEXT_B     (g_theme == THEME_LIGHT ? COL_L_CANCEL_TEXT_B     : COL_CANCEL_TEXT_B)
+
+#define TC_X_FILL_HOT   (g_theme == THEME_LIGHT ? COL_L_X_FILL_HOT   : COL_X_FILL_HOT)
+#define TC_X_FILL       (g_theme == THEME_LIGHT ? COL_L_X_FILL       : COL_X_FILL)
+#define TC_X_BORDER_HOT (g_theme == THEME_LIGHT ? COL_L_X_BORDER_HOT : COL_X_BORDER_HOT)
+#define TC_X_BORDER     (g_theme == THEME_LIGHT ? COL_L_X_BORDER     : COL_X_BORDER)
+#define TC_X_TEXT_HOT   (g_theme == THEME_LIGHT ? COL_L_X_TEXT_HOT   : COL_X_TEXT_HOT)
+#define TC_X_TEXT       (g_theme == THEME_LIGHT ? COL_L_X_TEXT       : COL_X_TEXT)
+
+#define TC_LABEL_SUBTLE (g_theme == THEME_LIGHT ? COL_L_LABEL_SUBTLE : COL_LABEL_SUBTLE)
+
+/* ─── Font faces ──────────────────────────────────────────────────────── */
+#define FONT_DISPLAY_DARK   L"Microsoft YaHei UI"
+#define FONT_DISPLAY_LIGHT  L"Georgia"
+#define FONT_BODY_DARK      L"Microsoft YaHei UI"
+#define FONT_BODY_LIGHT     L"Segoe UI"
+
+/* ─── Font sizes ──────────────────────────────────────────────────────── */
+#define FONT_SIZE_DISPLAY  -44
+#define FONT_SIZE_TITLE     -22
+#define FONT_SIZE_BODY      -18
+#define FONT_SIZE_RENAME    -16
+#define FONT_SIZE_CAPTION   -14
+
+/* ─── Design Tokens: Spacing (base-4 grid) ─────────────────────────────── */
+#define SPACE_1   4
+#define SPACE_2   8
+#define SPACE_3   12
+#define SPACE_4   16
+#define SPACE_5   20
+#define SPACE_6   24
+#define SPACE_8   32
+#define SPACE_10  40
+#define SPACE_12  48
+
+/* ─── Design Tokens: Radius ────────────────────────────────────────────── */
+#define RADIUS_SM   6
+#define RADIUS_MD  10
+#define RADIUS_LG  14
+#define RADIUS_XL  20
+#define RADIUS_2XL 24
 
 /* ─── Layout constants ─────────────────────────────────────────────────── */
 #define NSECT               8
@@ -88,11 +292,12 @@
 #define BTN_DELETE_HISTORY  1205
 #define CHK_AUTOSTART       1206
 #define BTN_UNDO            1207
+#define CHK_DARK_MODE       1208
 
-#define CONTENT_PAD         24
-#define COL_GAP             20
+#define CONTENT_PAD         SPACE_6
+#define COL_GAP             SPACE_3
 
-#define CLIPWHEEL_VERSION   L"2.2.0"
+#define CLIPWHEEL_VERSION   L"2.3.0"
 
 /* ─── Card list kind ────────────────────────────────────────────────────── */
 #define CARD_KIND_PIN      1
@@ -136,6 +341,7 @@ extern HWND g_record_btn_hwnd;
 extern HWND g_wheel_preview_hwnd;
 extern HWND g_auto_start_hwnd;
 extern HWND g_undo_btn_hwnd;
+extern HWND g_dark_mode_hwnd;
 
 /* ─── Configuration ────────────────────────────────────────────────────── */
 extern int g_vk;
@@ -165,9 +371,13 @@ extern int g_tray_added;
 extern int g_ignore_clip;
 extern int g_tray_tip_shown;
 
-/* ─── Config strings ───────────────────────────────────────────────────── */
 extern wchar_t g_ini[MAX_PATH];
 extern wchar_t g_hotkey_label[64];
+
+/* Inline rename state */
+extern HWND g_rename_edit;
+extern int g_rename_pin_index;
+void card_list_start_rename(HWND parent, int pin_index, int card_y);
 
 /* ─── Theme objects ────────────────────────────────────────────────────── */
 extern HFONT g_font_display;
@@ -175,9 +385,9 @@ extern HFONT g_font_title;
 extern HFONT g_font_body;
 extern HFONT g_font_body_bold;
 extern HFONT g_font_caption;
-extern HBRUSH g_brush_light;
-extern HBRUSH g_brush_dark;
-extern HBRUSH g_brush_white;
+extern HBRUSH g_brush_bg_deep;
+extern HBRUSH g_brush_bg_surface;
+extern HBRUSH g_brush_bg_card;
 
 /* ─── Preview state ────────────────────────────────────────────────────── */
 extern int   g_prev_hover_sector;
@@ -223,8 +433,8 @@ extern wchar_t g_manager_search_buf[256];
 /* ─── Navigation ───────────────────────────────────────────────────────── */
 #define NAV_H          60
 #define QUICK_CARD_H   64
-#define SETTINGS_H     100
-#define SECTION_GAP    12
+#define SETTINGS_H     130
+#define SECTION_GAP    SPACE_3
 
 /* ─── Function declarations ────────────────────────────────────────────── */
 
@@ -287,6 +497,11 @@ void sync_settings_controls(void);
 void push_undo(int action, int index, const wchar_t *text);
 int pop_undo(int *action, int *index, wchar_t *out, size_t cch_out);
 void apply_undo(HWND owner);
+
+#define INPUTBOX_CANCEL 0
+#define INPUTBOX_OK     1
+int input_box_show(HWND owner, const wchar_t *title, const wchar_t *prompt,
+                   const wchar_t *initial, wchar_t *out, size_t cch_out);
 
 /* cardlist.c */
 CardListState *card_list_state(HWND hwnd);
